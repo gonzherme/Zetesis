@@ -1,0 +1,4 @@
+__pycache__/
+fieldnotes.db
+fieldnotes.db-shm
+fieldnotes.db-wal

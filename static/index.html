@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f6f5f1">
+    <title>Zetesis — notes & inquiry</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Zetesis home">
+        <span class="brand-mark" aria-hidden="true">ζ</span>
+        <span class="brand-name">zetesis</span>
+      </a>
+      <div class="topbar-right">
+        <span class="local-indicator"><span></span> LOCAL NOTES · INQUIRY</span>
+        <button class="icon-button refresh-button" id="refresh-button" type="button" title="Refresh notes from disk" aria-label="Refresh notes from disk">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4.8 9a7.5 7.5 0 0 1 12.7-2.2L20 12M4 17v-5h5m10.2 3a7.5 7.5 0 0 1-12.7 2.2L4 12"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Note folders">
+        <div class="sidebar-scroll">
+          <div class="sidebar-label">ZETESIS</div>
+          <button class="nav-row active" id="all-notes" type="button">
+            <span class="nav-icon grid-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+            <span>All notes</span>
+            <span class="nav-count" id="all-count">—</span>
+          </button>
+          <div class="sidebar-label collections-label">FOLDERS</div>
+          <nav id="folder-tree" class="folder-tree" aria-label="Folders"></nav>
+        </div>
+        <div class="sidebar-note">
+          <span class="lock-icon" aria-hidden="true">ζ</span>
+          <div><strong>ζήτησις · inquiry</strong><span>Your notes live directly inside <code>zetesis/notes/</code>. Edit in Emacs, refresh here.</span></div>
+        </div>
+      </aside>
+
+      <main class="main-area">
+        <div class="page-heading">
+          <nav class="eyebrow" id="breadcrumb" aria-label="Breadcrumb">ZETESIS <span>/</span> ALL NOTES</nav>
+          <div class="heading-line">
+            <div>
+              <h1 id="page-title">All notes</h1>
+              <p id="page-subtitle">A calm place for your thinking and inquiry.</p>
+            </div>
+            <span class="result-total" id="result-total"></span>
+          </div>
+        </div>
+
+        <div class="search-bar">
+          <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m15.5 15.5 4.2 4.2"/></svg>
+          <input id="search-input" type="search" placeholder="Search notes, concepts, topics… (⌘K)" autocomplete="off" spellcheck="false" aria-label="Search notes">
+          <kbd>⌘ K</kbd>
+          <button id="clear-search" class="clear-search" type="button" aria-label="Clear search" hidden>×</button>
+        </div>
+
+        <div class="workspace-grid">
+          <section class="note-panel" aria-label="Notes">
+            <div class="list-heading"><span id="list-label">ALL NOTES</span><span id="list-count"></span></div>
+            <div id="note-list" class="note-list" aria-live="polite"></div>
+          </section>
+
+          <article class="reader-panel" id="reader-panel" aria-label="Note preview">
+            <div class="reader-empty" id="reader-empty">
+              <span class="empty-glyph" aria-hidden="true">ζ</span>
+              <h2>Pick a note to read</h2>
+              <p>Select any note from the list to preview it here.</p>
+            </div>
+            <div id="reader-content" class="reader-content" hidden></div>
+          </article>
+        </div>
+        <div class="toast" id="toast" role="status" aria-live="polite"></div>
+      </main>
+    </div>
+  </body>
+</html>
