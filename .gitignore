@@ -2,3 +2,6 @@ __pycache__/
 fieldnotes.db
 fieldnotes.db-shm
 fieldnotes.db-wal
+zetesis.sqlite3
+zetesis.sqlite3-shm
+zetesis.sqlite3-wal

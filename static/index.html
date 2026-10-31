@@ -5,75 +5,252 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#f6f5f1">
     <title>Zetesis — notes & inquiry</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="stylesheet" href="/static/styles.css">
     <script src="/static/app.js" defer></script>
   </head>
-  <body>
+  <body class="home-mode">
     <header class="topbar">
-      <a class="brand" href="/" aria-label="Zetesis home">
+      <a class="brand" id="brand-home" href="/" aria-label="Zetesis home">
         <span class="brand-mark" aria-hidden="true">ζ</span>
         <span class="brand-name">zetesis</span>
       </a>
       <div class="topbar-right">
-        <span class="local-indicator"><span></span> LOCAL NOTES · INQUIRY</span>
-        <button class="icon-button refresh-button" id="refresh-button" type="button" title="Refresh notes from disk" aria-label="Refresh notes from disk">
+        <button class="secondary-button" id="backup-button" type="button" title="Download a copy of your notes database">Export backup</button>
+        <button class="icon-button refresh-button" id="refresh-button" type="button" title="Refresh app data" aria-label="Refresh app data">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4.8 9a7.5 7.5 0 0 1 12.7-2.2L20 12M4 17v-5h5m10.2 3a7.5 7.5 0 0 1-12.7 2.2L4 12"/></svg>
         </button>
       </div>
     </header>
 
-    <div class="app-shell">
-      <aside class="sidebar" aria-label="Note folders">
+    <div class="app-shell home-mode">
+      <aside class="sidebar" aria-label="Note topics">
         <div class="sidebar-scroll">
-          <div class="sidebar-label">ZETESIS</div>
-          <button class="nav-row active" id="all-notes" type="button">
-            <span class="nav-icon grid-icon" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
-            <span>All notes</span>
-            <span class="nav-count" id="all-count">—</span>
+          <div class="sidebar-primary-nav">
+            <button class="nav-row search-nav-row active" id="nav-search" type="button" aria-current="page">
+              <span class="nav-icon search-nav-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m15.5 15.5 4.2 4.2"/></svg>
+              </span>
+              <span>Search</span>
+            </button>
+          </div>
+          <button class="nav-row" id="nav-roadmap" type="button">
+            <span class="nav-icon queue-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24"><path d="M4 6h11M4 12h10M4 18h11M17 9l4 3-4 3"/></svg>
+            </span>
+            <span>Up Next</span>
+            <span class="nav-count" id="roadmap-count">—</span>
           </button>
-          <div class="sidebar-label collections-label">FOLDERS</div>
+          <button class="nav-row" id="nav-projects" type="button">
+            <span class="nav-icon projects-icon" aria-hidden="true">✓</span>
+            <span>Projects</span>
+            <span class="nav-count" id="projects-count">—</span>
+          </button>
+          <button class="nav-row" id="nav-following" type="button">
+            <span class="nav-icon following-icon" aria-hidden="true">↗</span>
+            <span>Following</span>
+          </button>
+          <div class="sidebar-section-heading">
+            <div class="sidebar-label collections-label">TOPICS</div>
+            <button class="sidebar-add-button" id="new-topic" type="button" title="Create a topic">+</button>
+          </div>
           <nav id="folder-tree" class="folder-tree" aria-label="Folders"></nav>
-        </div>
-        <div class="sidebar-note">
-          <span class="lock-icon" aria-hidden="true">ζ</span>
-          <div><strong>ζήτησις · inquiry</strong><span>Your notes live directly inside <code>zetesis/notes/</code>. Edit in Emacs, refresh here.</span></div>
         </div>
       </aside>
 
       <main class="main-area">
-        <div class="page-heading">
-          <nav class="eyebrow" id="breadcrumb" aria-label="Breadcrumb">ZETESIS <span>/</span> ALL NOTES</nav>
+        <div class="home-heading" id="home-heading">
+          <h1>Find a topic or note</h1>
+        </div>
+
+        <div class="page-heading" id="page-heading" hidden>
+          <nav class="eyebrow" id="breadcrumb" aria-label="Breadcrumb">ZETESIS <span>/</span> NOTES</nav>
           <div class="heading-line">
             <div>
-              <h1 id="page-title">All notes</h1>
-              <p id="page-subtitle">A calm place for your thinking and inquiry.</p>
+              <h1 id="page-title">Notes</h1>
             </div>
-            <span class="result-total" id="result-total"></span>
           </div>
         </div>
 
-        <div class="search-bar">
+        <div class="search-bar home-search-bar" id="search-bar-container">
           <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m15.5 15.5 4.2 4.2"/></svg>
-          <input id="search-input" type="search" placeholder="Search notes, concepts, topics… (⌘K)" autocomplete="off" spellcheck="false" aria-label="Search notes">
-          <kbd>⌘ K</kbd>
+          <input id="search-input" type="search" placeholder="Search topics and notes" autocomplete="off" spellcheck="false" aria-label="Search topics and notes">
           <button id="clear-search" class="clear-search" type="button" aria-label="Clear search" hidden>×</button>
         </div>
 
-        <div class="workspace-grid">
+        <section class="home-suggestions" id="home-suggestions" aria-label="Search suggestions" aria-live="polite"></section>
+
+        <div class="workspace-grid" id="workspace-grid" hidden>
           <section class="note-panel" aria-label="Notes">
-            <div class="list-heading"><span id="list-label">ALL NOTES</span><span id="list-count"></span></div>
+            <div class="list-heading">
+              <span class="list-heading-actions"><span id="list-count"></span><button id="new-note" type="button" title="Create a note">+</button></span>
+            </div>
             <div id="note-list" class="note-list" aria-live="polite"></div>
           </section>
-
-          <article class="reader-panel" id="reader-panel" aria-label="Note preview">
-            <div class="reader-empty" id="reader-empty">
-              <span class="empty-glyph" aria-hidden="true">ζ</span>
-              <h2>Pick a note to read</h2>
-              <p>Select any note from the list to preview it here.</p>
-            </div>
-            <div id="reader-content" class="reader-content" hidden></div>
-          </article>
         </div>
+
+        <dialog class="note-viewer" id="note-viewer" aria-label="Note">
+          <div class="note-viewer-controls">
+            <button class="note-viewer-control-button" id="close-note-viewer" type="button" aria-label="Back to notes" title="Back to notes">←</button>
+            <span class="note-viewer-control-spacer"></span>
+            <button class="note-viewer-control-button" id="fullscreen-note-viewer" type="button" aria-label="Enter fullscreen" title="Enter fullscreen">⛶</button>
+          </div>
+          <div id="reader-content" class="reader-content" hidden></div>
+        </dialog>
+
+        <!-- Dedicated Up Next Dashboard -->
+        <div class="roadmap-view" id="roadmap-view" hidden>
+          <div class="roadmap-toolbar">
+            <div class="filter-pills" id="roadmap-pills">
+              <button class="pill active" data-type="all" type="button">All</button>
+              <button class="pill" data-type="next" type="button">Next Up</button>
+              <button class="pill" data-type="book" type="button">Books</button>
+              <button class="pill" data-type="podcast" type="button">Podcasts</button>
+              <button class="pill" data-type="video" type="button">Videos</button>
+              <button class="pill" data-type="idea" type="button">Ideas</button>
+            </div>
+            <button class="secondary-button" id="add-upnext-item" type="button">+ Add item</button>
+          </div>
+          <div class="roadmap-topics" id="roadmap-topics">
+            <!-- Topic cards and their resources render here -->
+          </div>
+        </div>
+
+        <section class="projects-view" id="projects-view" hidden aria-label="Projects">
+          <div class="projects-toolbar">
+            <div class="projects-filters" id="projects-filters" aria-label="Filter projects by status">
+              <button class="project-filter active" data-status="all" type="button">All</button>
+              <button class="project-filter" data-status="active" type="button">Active</button>
+              <button class="project-filter" data-status="planned" type="button">Planned</button>
+              <button class="project-filter" data-status="on_hold" type="button">On hold</button>
+              <button class="project-filter" data-status="completed" type="button">Completed</button>
+              <button class="project-filter" data-status="archived" type="button">Archived</button>
+            </div>
+            <button class="primary-button" id="new-project" type="button">+ New project</button>
+          </div>
+          <div class="projects-list" id="projects-list" aria-live="polite"></div>
+        </section>
+
+        <section class="following-view" id="following-view" hidden aria-label="Following">
+          <div class="following-toolbar">
+            <div class="following-filters" id="following-filters" aria-label="Filter followed content">
+              <button class="following-filter active" data-kind="all" type="button">All</button>
+              <button class="following-filter" data-kind="site" type="button">Sites</button>
+              <button class="following-filter" data-kind="blog" type="button">Blogs</button>
+              <button class="following-filter" data-kind="youtube" type="button">YouTube</button>
+              <button class="following-filter" data-kind="podcast" type="button">Podcasts</button>
+              <button class="following-filter" data-kind="article" type="button">Articles</button>
+              <button class="following-filter" data-kind="other" type="button">Other</button>
+            </div>
+            <button class="primary-button" id="new-following-item" type="button">+ Add link</button>
+          </div>
+          <div class="following-list" id="following-list" aria-live="polite"></div>
+        </section>
+
+        <dialog class="app-dialog" id="note-dialog">
+          <form id="note-form">
+            <h2>New note</h2>
+            <label for="new-note-title">Title</label>
+            <input id="new-note-title" type="text" maxlength="300" value="Untitled" required>
+            <label for="new-note-topic">Topic</label>
+            <select id="new-note-topic"></select>
+            <div class="dialog-actions">
+              <button class="secondary-button" id="cancel-new-note" type="button">Cancel</button>
+              <button class="primary-button" type="submit">Create note</button>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog class="app-dialog project-dialog" id="project-dialog">
+          <form id="project-form">
+            <h2 id="project-dialog-title">New project</h2>
+            <label for="project-title">Project</label>
+            <input id="project-title" type="text" maxlength="300" required>
+            <label for="project-description">Description</label>
+            <textarea id="project-description" maxlength="5000"></textarea>
+            <label for="project-status">Status</label>
+            <select id="project-status">
+              <option value="planned">Planned</option>
+              <option value="active">Active</option>
+              <option value="on_hold">On hold</option>
+              <option value="completed">Completed</option>
+              <option value="archived">Archived</option>
+            </select>
+            <input type="hidden" id="project-id" value="">
+            <div class="dialog-actions project-dialog-actions">
+              <button class="danger-button" id="delete-project" type="button" hidden>Delete project</button>
+              <span></span>
+              <button class="secondary-button" id="cancel-project" type="button">Cancel</button>
+              <button class="primary-button" type="submit" id="save-project">Create project</button>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog class="app-dialog following-dialog" id="following-dialog">
+          <form id="following-form">
+            <h2 id="following-dialog-title">Add link</h2>
+            <label for="following-title">Title</label>
+            <input id="following-title" type="text" maxlength="300" required>
+            <label for="following-url">URL</label>
+            <input id="following-url" type="url" maxlength="2048" placeholder="https://" required>
+            <label for="following-kind">Type</label>
+            <select id="following-kind">
+              <option value="site">Site</option>
+              <option value="blog">Blog</option>
+              <option value="youtube">YouTube</option>
+              <option value="podcast">Podcast</option>
+              <option value="article">Article</option>
+              <option value="other">Other</option>
+            </select>
+            <label for="following-description">Description</label>
+            <textarea id="following-description" maxlength="3000"></textarea>
+            <input type="hidden" id="following-id" value="">
+            <div class="dialog-actions following-dialog-actions">
+              <button class="danger-button" id="delete-following-item" type="button" hidden>Delete link</button>
+              <span></span>
+              <button class="secondary-button" id="cancel-following-item" type="button">Cancel</button>
+              <button class="primary-button" type="submit" id="save-following-item">Add link</button>
+            </div>
+          </form>
+        </dialog>
+
+        <dialog class="app-dialog" id="upnext-item-dialog">
+          <form id="upnext-item-form">
+            <h2 id="upnext-dialog-title">Add item</h2>
+            <label for="upnext-item-title">Title</label>
+            <input id="upnext-item-title" type="text" maxlength="300" required>
+            <label for="upnext-item-topic">Topic / Category</label>
+            <input id="upnext-item-topic" type="text" maxlength="100" list="upnext-topics-list" autocomplete="off">
+            <datalist id="upnext-topics-list"></datalist>
+            <label for="upnext-item-subtopic">Subtopic (optional)</label>
+            <input id="upnext-item-subtopic" type="text" maxlength="100" list="upnext-subtopics-list" autocomplete="off">
+            <datalist id="upnext-subtopics-list"></datalist>
+            <label for="upnext-item-type">Type</label>
+            <select id="upnext-item-type">
+              <option value="book">Book</option>
+              <option value="podcast">Podcast</option>
+              <option value="video">Video</option>
+              <option value="idea">Idea</option>
+            </select>
+            <label for="upnext-item-status">Status</label>
+            <select id="upnext-item-status">
+              <option value="NEXT">Next</option>
+              <option value="TODO">To do</option>
+              <option value="IN_PROGRESS">In progress</option>
+              <option value="DONE">Done</option>
+            </select>
+            <label for="upnext-item-author">Author / Creator (optional)</label>
+            <input id="upnext-item-author" type="text" maxlength="200">
+            <label for="upnext-item-focus">Focus / Description (optional)</label>
+            <input id="upnext-item-focus" type="text" maxlength="500">
+            <input type="hidden" id="upnext-item-index" value="">
+            <div class="dialog-actions">
+              <button class="secondary-button" id="cancel-upnext-item" type="button">Cancel</button>
+              <button class="primary-button" type="submit" id="upnext-item-submit">Add item</button>
+            </div>
+          </form>
+        </dialog>
+
         <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </main>
     </div>
