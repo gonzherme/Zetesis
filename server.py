@@ -62,7 +62,6 @@ PRESENCE_CLIENT_RE = re.compile(r"^[0-9a-f-]{8,64}$")
 # while for Undo.
 MAP_ID_RE = re.compile(r"^[0-9a-f-]{8,64}$")
 MAX_MAP_BOX_TEXT = 2000
-MAX_MAP_NOTES = 20000
 MAX_MAP_DISTANCE = 1_000_000
 MAP_DELETED_DAYS = 30
 
@@ -480,7 +479,8 @@ def initialize_database(convert_bodies: bool = True) -> None:
             CREATE TABLE IF NOT EXISTS map_boxes (
                 id TEXT PRIMARY KEY,
                 text TEXT NOT NULL,
-                notes TEXT NOT NULL DEFAULT '', -- its note, opened with a right-click
+                note_body TEXT,              -- its note, opened with a right-click: an editor document
+                notes TEXT NOT NULL DEFAULT '', -- the note's text, for finding boxes
                 x REAL NOT NULL,             -- where its top left corner is on the map
                 y REAL NOT NULL,
                 deleted_at TEXT,
@@ -496,7 +496,7 @@ def initialize_database(convert_bodies: bool = True) -> None:
         """)
         # Boxes made before they could hold notes.
         map_columns = {row["name"] for row in connection.execute("PRAGMA table_info(map_boxes)")}
-        for column, definition in (("notes", "TEXT NOT NULL DEFAULT ''"),):
+        for column, definition in (("notes", "TEXT NOT NULL DEFAULT ''"), ("note_body", "TEXT")):
             if column not in map_columns:
                 connection.execute(f"ALTER TABLE map_boxes ADD COLUMN {column} {definition}")
         cutoff = (datetime.now() - timedelta(days=MAP_DELETED_DAYS)).isoformat(timespec="seconds")
@@ -945,7 +945,7 @@ def _clean_location(collection: str, folder: str) -> tuple[str, str] | None:
 def _map() -> dict:
     with _database() as connection:
         boxes = connection.execute(
-            "SELECT id, text, notes, x, y FROM map_boxes WHERE deleted_at IS NULL ORDER BY created, rowid"
+            "SELECT id, text, notes, note_body, x, y FROM map_boxes WHERE deleted_at IS NULL ORDER BY created, rowid"
         ).fetchall()
         arrows = connection.execute("""
             SELECT map_arrows.id, map_arrows.from_id, map_arrows.to_id FROM map_arrows
@@ -954,7 +954,10 @@ def _map() -> dict:
             WHERE map_arrows.deleted_at IS NULL AND source.deleted_at IS NULL AND target.deleted_at IS NULL
             ORDER BY map_arrows.created, map_arrows.rowid
         """).fetchall()
-    return {"boxes": [dict(row) for row in boxes], "arrows": [dict(row) for row in arrows]}
+    # A note from before notes were written in the editor is only its text, which the page turns into
+    # paragraphs.
+    return {"boxes": [{**dict(row), "note_body": json.loads(row["note_body"]) if row["note_body"] else None} for row in boxes],
+            "arrows": [dict(row) for row in arrows]}
 
 
 def _map_id(value) -> str:
@@ -972,16 +975,6 @@ def _map_text(value) -> str:
     if len(text) > MAX_MAP_BOX_TEXT:
         raise ValueError(f"A box holds at most {MAX_MAP_BOX_TEXT} characters.")
     return text
-
-
-def _map_notes(value) -> str:
-    """A box's note, which can be empty."""
-    if not isinstance(value, str):
-        raise ValueError("A box's notes are text.")
-    notes = "\n".join(line.rstrip() for line in value.splitlines()).strip("\n")
-    if len(notes) > MAX_MAP_NOTES:
-        raise ValueError(f"A box's notes hold at most {MAX_MAP_NOTES} characters.")
-    return notes
 
 
 def _map_place(value) -> float:
@@ -1009,8 +1002,13 @@ def _update_map_box(box_id: str, payload: dict) -> None:
             raise LookupError("That box does not exist.")
         if "text" in payload:
             connection.execute("UPDATE map_boxes SET text = ? WHERE id = ?", (_map_text(payload["text"]), box_id))
-        if "notes" in payload:
-            connection.execute("UPDATE map_boxes SET notes = ? WHERE id = ?", (_map_notes(payload["notes"]), box_id))
+        if "note_body" in payload:
+            # Checked as a note's body is, and kept with its text for finding the box.
+            body, error = _parse_body({"body": payload["note_body"], "body_format_version": payload.get("body_format_version")})
+            if error or body is None:
+                raise ValueError(error or "A box's note must be an editor document.")
+            body_json, text, _excerpt = _body_fields(body)
+            connection.execute("UPDATE map_boxes SET note_body = ?, notes = ? WHERE id = ?", (body_json, text, box_id))
         if "x" in payload or "y" in payload:
             connection.execute("UPDATE map_boxes SET x = ?, y = ? WHERE id = ?", (
                 _map_place(payload.get("x", box["x"])), _map_place(payload.get("y", box["y"])), box_id))
@@ -2088,6 +2086,8 @@ class ZetesisHandler(BaseHTTPRequestHandler):
                     "SELECT 1 FROM note_assets WHERE asset_id = ? LIMIT 1", (asset_id,)
                 ).fetchone() or connection.execute(
                     "SELECT 1 FROM notes WHERE instr(body_json, ?) > 0 LIMIT 1", (asset_id,)
+                ).fetchone() or connection.execute(
+                    "SELECT 1 FROM map_boxes WHERE instr(note_body, ?) > 0 LIMIT 1", (asset_id,)
                 ).fetchone()
                 if still_used:
                     continue

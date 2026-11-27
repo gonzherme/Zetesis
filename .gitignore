@@ -1,11 +1,18 @@
-__pycache__/
-fieldnotes.db
-fieldnotes.db-shm
-fieldnotes.db-wal
-zetesis.sqlite3
-zetesis.sqlite3-shm
-zetesis.sqlite3-wal
+# ---- Personal data: notes stay on this Mac, never in git ----
+# Original note files (imported into the database once; kept as a recovery copy)
+notes/
+# The database: source of truth for every note
+*.sqlite3
+*.sqlite3-*
+# Old database name
+*.db
+*.db-*
 # Files pasted or dropped into notes (referenced from the database)
 assets/
+# Backups made by the app
 backups/
+
+# ---- Tooling / OS ----
+__pycache__/
 frontend/node_modules/
+.DS_Store

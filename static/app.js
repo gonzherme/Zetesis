@@ -4633,6 +4633,10 @@ document.addEventListener("keydown", (e) => {
   if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && state.editorSession) {
     e.preventDefault();
     saveNoteSession(state.editorSession);
+  } else if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && mapNoteFor) {
+    // A box's note in Roadmap (map.js).
+    e.preventDefault();
+    saveMapNote();
   }
   // ⌘F searches the folder on screen; in an open note it's left to the
   // browser's find, which searches only the note (the page behind it is
@@ -4736,7 +4740,7 @@ const MENU_COMMANDS = {
   roadmap: () => switchToMap(),
   following: () => openFollowingNote(),
   newNote: () => openNewNoteDialog(),
-  save: () => state.editorSession && saveNoteSession(state.editorSession),
+  save: () => (state.editorSession ? saveNoteSession(state.editorSession) : saveMapNote()),
   backup: () => $("#backup-button").click(),
   shortcuts: () => { helpOverlay.hidden = false; },
 };
@@ -4748,6 +4752,11 @@ function menuCommand(name) {
 // Before quitting or reloading, Zetesis's Mac app has the open note saved now, and shows what would
 // still be lost, if anything; a browser asks before leaving instead. A save that hangs counts as lost.
 async function prepareToLeave() {
+  // A box's note open in Roadmap saves first.
+  if (mapNoteUnsaved()) {
+    saveMapNote();
+    await mapWrites;
+  }
   const session = state.editorSession;
   if (!session) return "";
   const title = noteSnapshot(session)?.title || "the open note";

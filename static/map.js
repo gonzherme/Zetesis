@@ -1,7 +1,7 @@
 "use strict";
 
 // Roadmap: a map of boxes of text joined by arrows, on a space that pans and zooms, like a mind map.
-// Right-clicking a box opens its note, a large card over the map, for details about it.
+// Right-clicking a box opens its note, a window over the map written in the same editor as a note.
 // Boxes and arrows are kept by the server; where you are on the map, and how near, is this browser's
 // own. Loaded before app.js, whose state, toast and search box it uses once Roadmap is open. (Its code
 // says "map": "roadmap" in app.js is what the sidebar calls Explore.)
@@ -27,10 +27,14 @@ const mapPending = document.getElementById("map-pending");
 const mapEmpty = document.getElementById("map-empty");
 const MAP_HINT = mapEmpty.innerHTML;
 const mapNote = document.getElementById("map-note");
+const mapNoteHead = mapNote.querySelector(".map-note-head");
 const mapNoteTitle = mapNote.querySelector(".map-note-title");
 const mapNoteClose = mapNote.querySelector(".map-note-close");
-const mapNoteText = mapNote.querySelector(".map-note-text");
+const mapNoteBody = mapNote.querySelector(".map-note-body");
+const mapNoteEditorEl = mapNote.querySelector(".map-note-editor");
 const MAP_NOTE_SAVE_MS = 800;
+// Where the note's window was moved to, and its size: this browser's own.
+const MAP_NOTE_PLACE_KEY = "zetesis.map.note";
 
 const mapData = { boxes: [], arrows: [], loaded: false };
 // The map's place on screen: a point on it shows at (point * zoom + x, point * zoom + y). Null until
@@ -53,6 +57,10 @@ let mapWrites = Promise.resolve();
 let mapNoteFor = null;
 let mapNoteAtPress = null;
 let mapNoteTimer = 0;
+// The open note's editor, what it last saved, and the window being dragged by its title.
+let mapNoteEditor = null;
+let mapNoteSaved = "";
+let mapNoteDrag = null;
 
 const mapBoxes = () => (mapDraft ? [...mapData.boxes, mapDraft.box] : mapData.boxes);
 const mapArrowList = () => (mapDraft?.arrow ? [...mapData.arrows, mapDraft.arrow] : mapData.arrows);
@@ -408,61 +416,155 @@ function finishMapEdit(element, save) {
   renderMap();
 }
 
-// A box's note: a large card over most of the map, below the title, opened with a right-click, for
-// details about it. It saves as it's written, and closes with Esc, its ×, or a click on the map.
+// A box's note: a window over the map, opened with a right-click, written in the same editor as a note
+// (with the same blocks, menus and keys). It saves as it's written, and closes with Esc, its ×, a click
+// on the map, or right-clicking the box again. Dragged by its title, and resized from its corner, it
+// opens where it was left.
 function openMapNote(id) {
   closeMapNote();
   const box = mapData.boxes.find((other) => other.id === id);
   if (!box) return;
+  if (!window.ZetesisEditor) {
+    showToast("The editor couldn't be loaded. Reload the page to try again.");
+    return;
+  }
   mapNoteFor = id;
   mapNoteTitle.textContent = box.text;
-  mapNoteText.value = box.notes ?? "";
-  mapNote.style.top = `${mapTop()}px`;
   mapNote.hidden = false;
-  mapNoteText.scrollTop = 0;
+  placeMapNoteWindow(loadMapNotePlace());
+  let ready = false;
+  mapNoteEditor = window.ZetesisEditor.createNoteEditor({
+    element: mapNoteEditorEl,
+    content: box.note_body ?? notesAsDocument(box.notes),
+    scrollContainer: mapNoteBody,
+    onChange: () => {
+      if (!ready) return;
+      clearTimeout(mapNoteTimer);
+      mapNoteTimer = setTimeout(saveMapNote, MAP_NOTE_SAVE_MS);
+    },
+    // A link to a note opens it, once this one is put away.
+    onOpenNote: (path) => setTimeout(() => {
+      closeMapNote();
+      openLinkedNote(path);
+    }),
+    onEscape: () => closeMapNote(),
+    onNotice: showToast,
+    askText,
+    uploadFile: (file) => uploadAsset(file, ""),
+    findNotes: findNotesForLink,
+    listPdfNotes,
+    folded: foldedSections(`map:${id}`),
+    onFoldChange: (ids) => rememberFoldedSections(`map:${id}`, ids),
+  });
+  mapNoteSaved = JSON.stringify(mapNoteEditor.getJSON());
+  ready = true;
+  // Never save over a note this editor can't show faithfully.
+  if (mapNoteEditor.contentError) showToast("This note can't be shown faithfully here, so it's read-only.");
+  mapNoteBody.scrollTop = 0;
   selectMapItem("box", id);
-  mapNoteText.focus({ preventScroll: true });
-  mapNoteText.setSelectionRange(mapNoteText.value.length, mapNoteText.value.length);
+  mapNoteEditor.focus("end");
 }
 
-function saveMapNote() {
+// A note from before notes were written in the editor: its lines, as paragraphs.
+function notesAsDocument(text) {
+  const lines = (text ?? "").split("\n");
+  return { type: "doc", content: lines.map((line) => (line.trim() ? { type: "paragraph", content: [{ type: "text", text: line }] } : { type: "paragraph" })) };
+}
+
+function saveMapNote({ keepalive = false } = {}) {
   clearTimeout(mapNoteTimer);
   const box = mapNoteFor && findMapBox(mapNoteFor);
-  if (!box) return;
-  const notes = mapNoteText.value.split("\n").map((line) => line.trimEnd()).join("\n").replace(/^\n+|\n+$/g, "");
-  if (notes === (box.notes ?? "")) return;
-  box.notes = notes;
-  mapWrite("PATCH", `/api/map/boxes/${box.id}`, { notes });
-  renderMap();
+  if (!box || !mapNoteEditor || mapNoteEditor.contentError) return;
+  const body = mapNoteEditor.getJSON();
+  const json = JSON.stringify(body);
+  if (json === mapNoteSaved) return;
+  mapNoteSaved = json;
+  box.note_body = body;
+  box.notes = mapNoteEditor.editor.getText({ blockSeparator: "\n" }).trim();
+  const change = { note_body: body, body_format_version: window.ZetesisEditor.BODY_FORMAT_VERSION };
+  // Leaving the page can't wait for the writes before it.
+  if (keepalive) fetch(`/api/map/boxes/${box.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(change), keepalive: true });
+  else mapWrite("PATCH", `/api/map/boxes/${box.id}`, change);
+}
+
+// Whether the open note has anything not yet saved (for leaving, or quitting the Mac app).
+function mapNoteUnsaved() {
+  return Boolean(mapNoteEditor && !mapNoteEditor.contentError && JSON.stringify(mapNoteEditor.getJSON()) !== mapNoteSaved);
 }
 
 function closeMapNote() {
   if (!mapNoteFor) return;
+  if (mapNoteEditor?.hasPendingUploads()) showToast("A file was still uploading into the note, and won't be in it.");
   saveMapNote();
   mapNoteFor = null;
+  mapNoteEditor?.destroy();
+  mapNoteEditor = null;
   mapNote.hidden = true;
-  if (document.activeElement === mapNoteText) mapNoteText.blur();
   renderMap();
 }
 
-mapNoteText.addEventListener("input", () => {
-  clearTimeout(mapNoteTimer);
-  mapNoteTimer = setTimeout(saveMapNote, MAP_NOTE_SAVE_MS);
-});
+// The window as it was left, if it still fits; otherwise most of the map, below the title.
+function loadMapNotePlace() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(MAP_NOTE_PLACE_KEY));
+    if ([saved?.left, saved?.top, saved?.width, saved?.height].every(Number.isFinite)) return saved;
+  } catch {
+    // Storage can be off; the window then opens in its usual place.
+  }
+  const area = mapEl.getBoundingClientRect();
+  const top = mapTop();
+  const width = Math.min(920, area.width - 64);
+  return { left: (area.width - width) / 2, top, width, height: area.height - top - 28 };
+}
 
-// Enter starts a new line; Esc or ⌘ Enter closes the note, keeping what's written.
-mapNoteText.addEventListener("keydown", (event) => {
-  if (event.isComposing || !(event.key === "Escape" || (event.key === "Enter" && (event.metaKey || event.ctrlKey)))) return;
+// It can hang off the map's edges, as a window can off the screen's, so it can be put aside; enough of
+// its title stays on the map to drag it back.
+const MAP_NOTE_GRIP = 120;
+
+function placeMapNoteWindow({ left, top, width, height }) {
+  const area = mapEl.getBoundingClientRect();
+  width = mapClamp(width, Math.min(320, area.width - 16), area.width - 16);
+  height = mapClamp(height, Math.min(200, area.height - 16), area.height - 16);
+  left = mapClamp(left, MAP_NOTE_GRIP - width, area.width - MAP_NOTE_GRIP);
+  top = mapClamp(top, 0, area.height - 48);
+  Object.assign(mapNote.style, { left: `${Math.round(left)}px`, top: `${Math.round(top)}px`, width: `${Math.round(width)}px`, height: `${Math.round(height)}px` });
+}
+
+function saveMapNotePlace() {
+  const { offsetLeft: left, offsetTop: top, offsetWidth: width, offsetHeight: height } = mapNote;
+  try {
+    localStorage.setItem(MAP_NOTE_PLACE_KEY, JSON.stringify({ left, top, width, height }));
+  } catch {
+    // Only a convenience.
+  }
+}
+
+// Dragging the title moves the window; the editor keeps the keyboard.
+mapNoteHead.addEventListener("pointerdown", (event) => {
+  if (event.button !== 0 || event.target.closest("button")) return;
   event.preventDefault();
-  event.stopPropagation();
-  closeMapNote();
+  mapNoteDrag = { x: event.clientX - mapNote.offsetLeft, y: event.clientY - mapNote.offsetTop };
+  mapNote.classList.add("dragging");
+  mapNoteHead.setPointerCapture(event.pointerId);
 });
+mapNoteHead.addEventListener("pointermove", (event) => {
+  if (!mapNoteDrag) return;
+  placeMapNoteWindow({ left: event.clientX - mapNoteDrag.x, top: event.clientY - mapNoteDrag.y, width: mapNote.offsetWidth, height: mapNote.offsetHeight });
+});
+mapNoteHead.addEventListener("pointerup", () => {
+  if (!mapNoteDrag) return;
+  mapNoteDrag = null;
+  mapNote.classList.remove("dragging");
+  saveMapNotePlace();
+});
+// Resizing from the corner is the browser's own; the size is kept as it ends.
+new ResizeObserver(() => {
+  if (!mapNote.hidden && !mapNoteDrag) saveMapNotePlace();
+}).observe(mapNote);
 
-// Pressing anywhere else closes it; switching to another app leaves it open.
-mapNoteText.addEventListener("blur", () => {
-  if (document.hasFocus()) closeMapNote();
-});
 mapNoteClose.addEventListener("click", () => closeMapNote());
+// Leaving the page saves what's written.
+addEventListener("pagehide", () => saveMapNote({ keepalive: true }));
 
 // A new box, written straight away, and joined to the box `from` when given.
 function startMapBox(x, y, from = null) {
@@ -583,11 +685,8 @@ mapBoxesEl.addEventListener("input", () => drawMapArrows());
 
 mapEl.addEventListener("pointerdown", (event) => {
   mapNoteAtPress = mapNoteFor;
-  // Presses in the note stay there; only its text takes the keyboard, so the note stays open.
-  if (event.target.closest(".map-note")) {
-    if (event.target !== mapNoteText) event.preventDefault();
-    return;
-  }
+  // The note's window takes its own presses: its editor, and its title for moving it.
+  if (event.target.closest(".map-note")) return;
   // ⌃-click is a right-click on a Mac.
   if (event.button !== 0 || event.ctrlKey || mapGesture) return;
   const handle = event.target.closest(".map-handle");
@@ -597,7 +696,7 @@ mapEl.addEventListener("pointerdown", (event) => {
   // Anything else ends writing, and keeps the keyboard off the box's dot. An open note keeps it, so
   // dragging the map or a box leaves the note open; a click closes it, when let go.
   event.preventDefault();
-  if (document.activeElement !== mapNoteText) document.activeElement?.blur();
+  if (!mapNote.contains(document.activeElement)) document.activeElement?.blur();
   const start = { x: event.clientX, y: event.clientY };
   const arrowEl = event.target.closest(".map-arrow");
   if (handle && findMapBox(boxEl.dataset.key)) {

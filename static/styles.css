@@ -529,15 +529,17 @@ body.map-mode .page-heading :is(a, button) { pointer-events: auto; }
 .map-handle { position: absolute; top: 50%; right: -7px; width: 13px; height: 13px; margin-top: -6.5px; padding: 0; border: 1.5px solid var(--green); border-radius: 50%; background: var(--panel); opacity: 0; cursor: crosshair; }
 .map-box:hover .map-handle, .map-box.selected .map-handle { opacity: 1; }
 .map-box.editing .map-handle { display: none; }
-/* A box's note, opened with a right-click: a large card over most of the map, below the title (its
-   top is set from the title's height). */
-.map-note { position: absolute; z-index: 4; left: 50%; bottom: 28px; width: min(920px, calc(100% - 64px)); transform: translateX(-50%); display: flex; flex-direction: column; padding: 18px 22px 16px; background: var(--panel); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow); cursor: default; }
-.map-note-head { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
-.map-note-title { flex: 1; min-width: 0; overflow: hidden; color: var(--heading); font: 500 21px/1.3 var(--serif); letter-spacing: -.01em; text-overflow: ellipsis; white-space: nowrap; }
-.map-note-close { width: 30px; height: 30px; flex: none; display: grid; place-items: center; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-size: 20px; line-height: 1; }
+/* A box's note, opened with a right-click: a window over the map, written in the note editor. map.js
+   places and sizes it; its title moves it, and its corner resizes it. The left padding leaves room for
+   the editor's block handle. */
+.map-note { position: absolute; z-index: 4; min-width: 320px; min-height: 200px; display: flex; flex-direction: column; overflow: hidden; resize: both; background: var(--panel); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow); cursor: auto; touch-action: auto; user-select: text; -webkit-user-select: text; }
+.map-note-head { flex: none; display: flex; align-items: center; gap: 12px; padding: 14px 14px 8px 63px; cursor: grab; user-select: none; -webkit-user-select: none; }
+.map-note.dragging .map-note-head { cursor: grabbing; }
+/* The size of a note's own title. */
+.map-note-title { flex: 1; min-width: 0; overflow: hidden; color: var(--heading); font: 500 clamp(26px, 3.4vw, 34px)/1.25 var(--serif); letter-spacing: -.03em; text-overflow: ellipsis; white-space: nowrap; }
+.map-note-close { width: 30px; height: 30px; flex: none; display: grid; place-items: center; padding: 0; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font-size: 20px; line-height: 1; cursor: pointer; }
 .map-note-close:hover { background: var(--hover-bg); color: var(--ink); }
-.map-note-text { flex: 1; min-height: 0; width: 100%; margin: 0; padding: 0; border: 0; outline: 0; resize: none; overflow-y: auto; background: transparent; color: var(--ink); font: inherit; font-size: 15px; line-height: 1.6; user-select: text; -webkit-user-select: text; }
-.map-note-text::placeholder { color: var(--soft); }
+.map-note-body { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 28px 48px 30px; }
 
 .map-empty { position: absolute; top: 45%; left: 0; right: 0; margin: 0; color: var(--soft); line-height: 1.7; text-align: center; pointer-events: none; }
 .map-zoom { display: flex; align-items: center; gap: 2px; }

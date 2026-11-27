@@ -110,12 +110,13 @@
             <div id="map-boxes"></div>
           </div>
           <p class="map-empty" id="map-empty">Double-click anywhere to add a box.<br>Drag from a box's dot to another box to join them.<br>Right-click a box for a note about it.</p>
+          <!-- A box's note: a window written in the note editor, moved by its title (map.js). -->
           <div class="map-note" id="map-note" role="dialog" aria-label="Note" hidden>
-            <div class="map-note-head">
+            <div class="map-note-head" title="Drag to move">
               <div class="map-note-title"></div>
               <button class="map-note-close" type="button" aria-label="Close the note" title="Close (Esc)">×</button>
             </div>
-            <textarea class="map-note-text" placeholder="Details…" aria-label="Note" spellcheck="true"></textarea>
+            <div class="map-note-body"><div class="map-note-editor note-editor"></div></div>
           </div>
         </div>
 

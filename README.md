@@ -130,12 +130,12 @@ Outlines from earlier versions still load: their tagged headings and detail bull
 - **Join boxes** by dragging from the dot on a box's right edge onto another box. Let go on empty space instead, and a new box starts there, already joined. With a box selected, `Tab` adds a box joined to it, to its right; `Tab` while writing does the same, so a chain of ideas can be typed out in one go. Two boxes are joined once, whichever way the arrow points.
 - **Edit** by double-clicking a box, clicking the selected box, or pressing `Enter` (or `e`). Clicking away saves; `Esc` puts the text back. Emptying a box deletes it.
 - **Move** a box by dragging it; its arrows follow.
-- **Notes**: right-click a box (or `⌃`-click it) to open its note, a large card over most of the map, and write more about it. It saves as you type; `Enter` starts a new line. `Esc`, `⌘ Enter`, its `×`, or a click on the map closes it.
+- **Notes**: right-click a box (or `⌃`-click it) to open its note, a window over the map written in the same editor as a note: headings, lists, links, images and the `/` menu all work as they do there. It saves as you type. Drag it by its title to move it, and by its corner to resize it; it opens where you left it. `Esc`, its `×`, a click on the map, or right-clicking the box again closes it.
 - **Delete** a box or an arrow by clicking it and pressing `⌫`, with Undo in the message that follows. Deleting a box takes its arrows with it, and Undo brings them back.
 - **Move around** by dragging empty space, or scrolling with two fingers; pinch to zoom, or use `−` and `+` at the top. **Show All** fits every box on screen. Each browser, and the Mac app, remembers where you were.
 - **Find boxes** with `⌘ F`: the boxes that don't match what you type, in their text or notes, are dimmed. `Esc` puts the find box away.
 
-Boxes and arrows are kept in the database (tables `map_boxes` and `map_arrows`), so Export backup includes them. Deleted ones are kept for 30 days, for Undo, then removed when the server starts.
+Boxes, their notes and arrows are kept in the database (tables `map_boxes` and `map_arrows`), so Export backup includes them. Deleted ones are kept for 30 days, for Undo, then removed when the server starts.
 
 ## Following
 
