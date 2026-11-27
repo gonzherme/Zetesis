@@ -1,0 +1,27 @@
+{
+  "name": "zetesis-editor",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Block editor bundle for Zetesis. The built file is committed under static/editor/.",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check-docs": "node scripts/check-docs.mjs"
+  },
+  "dependencies": {
+    "@floating-ui/dom": "1.8.0",
+    "@tiptap/core": "3.32.2",
+    "@tiptap/extension-bubble-menu": "3.32.2",
+    "@tiptap/extension-highlight": "3.32.2",
+    "@tiptap/extension-list": "3.32.2",
+    "@tiptap/extension-table": "3.32.2",
+    "@tiptap/extension-unique-id": "3.32.2",
+    "@tiptap/extensions": "3.32.2",
+    "@tiptap/pm": "3.32.2",
+    "@tiptap/starter-kit": "3.32.2",
+    "@tiptap/suggestion": "3.32.2"
+  },
+  "devDependencies": {
+    "vite": "8.3.5"
+  }
+}

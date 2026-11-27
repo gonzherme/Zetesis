@@ -11,15 +11,19 @@ const state = {
   documentRequestId: 0,
   view: "home",
   roadmap: null,
-  roadmapFilter: "all",
   roadmapTopic: "",
   roadmapTopicFromIndex: false,
-  projects: null,
-  projectFilter: "all",
-  following: null,
-  followingFilter: "all",
   draggedNotePath: "",
+  draggedFolderPath: "",
+  // Folders inside topics, in sidebar order: [{ path, label }].
+  folders: [],
+  folderLabels: new Map(),
   editorSession: null,
+  selectedPayload: null,
+  // Path → promise of the save in flight, so reopening a note waits for it.
+  pendingSaves: new Map(),
+  // Path → edits whose background save failed after their note was closed.
+  unsavedDrafts: new Map(),
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -30,21 +34,22 @@ const readerContent = $("#reader-content");
 const searchBar = $("#search-bar-container");
 const workspaceGrid = $("#workspace-grid");
 const roadmapView = $("#roadmap-view");
-const projectsView = $("#projects-view");
-const followingView = $("#following-view");
 const pageHeading = $("#page-heading");
 const homeHeading = $("#home-heading");
 const homeSuggestions = $("#home-suggestions");
 const appShell = $(".app-shell");
-const projectsList = $("#projects-list");
-const followingList = $("#following-list");
 const roadmapTopics = $("#roadmap-topics");
-const roadmapPills = $("#roadmap-pills");
+const contextMenu = $("#context-menu");
+const helpOverlay = $("#help");
+const searchInput = $("#search-input");
+const pageMenuButton = $("#page-menu");
 const navRoadmap = $("#nav-roadmap");
-const navProjects = $("#nav-projects");
+const navMap = $("#nav-map");
+const mapZoom = $("#map-zoom");
 const navFollowing = $("#nav-following");
 const navSearch = $("#nav-search");
-const TEXT_EXTENSIONS_FOR_UI = new Set([".md", ".org"]);
+const AUTOSAVE_DELAY_MS = 800;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const PDFJS_CDN = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/6.4.299/";
 let pdfjsModulePromise = null;
 let activePdfViewer = null;
@@ -75,51 +80,790 @@ function formatDate(value) {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", year: "numeric" }).format(date);
 }
 
-function buildFolderTree(documents) {
-  const roots = new Map();
+const CHECK_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>';
+// Symbols beside search results on the start page (notes show their file type instead).
+const HOME_RESULT_ICONS = {
+  folder: folderSvg,
+  explore: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"/><path d="m14.8 9.2-1.6 4-4 1.6 1.6-4z"/></svg>',
+  following: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5.5 5.5a13 13 0 0 1 13 13M5.5 11a7.5 7.5 0 0 1 7.5 7.5"/><circle cx="6.5" cy="17.5" r="1"/></svg>',
+  map: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="5" width="7" height="5" rx="1.5"/><rect x="13.5" y="14" width="7" height="5" rx="1.5"/><path d="M10.5 7.5h3a2 2 0 0 1 2 2V14"/></svg>',
+  area: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7h10M9 12h10M9 17h10M5 7h.01M5 12h.01M5 17h.01"/></svg>',
+  item: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/></svg>',
+  done: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><path d="m9 12.3 2.1 2.1 3.9-3.9"/></svg>',
+};
+const TRASH_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 7h15M9.5 7V4.5h5V7M6.5 7l1 13h9l1-13M10.5 11v5.5M13.5 11v5.5"/></svg>';
 
-  for (const [key, label] of Object.entries(state.collections)) {
-    roots.set(key, {
-      name: label || formatFolderName(key),
-      path: key,
-      count: 0,
-      children: new Map(),
+// ── Menus and in-place editing ───────────────────────────────────────────────
+
+let closeContextMenu = null;
+
+// A menu at the pointer (`at` is a mouse event) or under a button (`at` is the
+// element). Items are { label, onPick, detail, title, danger, disabled },
+// { heading }, or "-" for a divider.
+function openMenu(at, items) {
+  closeMenu();
+  contextMenu.replaceChildren();
+  for (const item of items) {
+    if (item === "-") {
+      contextMenu.append(document.createElement("hr"));
+      continue;
+    }
+    if (item.heading) {
+      const heading = document.createElement("div");
+      heading.className = "menu-heading";
+      heading.textContent = item.heading;
+      contextMenu.append(heading);
+      continue;
+    }
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = `menu-item${item.danger ? " danger" : ""}`;
+    button.setAttribute("role", "menuitem");
+    button.disabled = Boolean(item.disabled);
+    if (item.title) button.title = item.title;
+    const label = document.createElement("span");
+    label.textContent = item.label;
+    button.append(label);
+    if (item.detail) {
+      const detail = document.createElement("small");
+      detail.textContent = item.detail;
+      button.append(detail);
+    }
+    button.addEventListener("click", () => {
+      closeMenu();
+      item.onPick();
     });
+    contextMenu.append(button);
   }
 
-  for (const doc of documents) {
-    const colKey = doc.collection || "general";
-    let root = roots.get(colKey);
-    if (!root) {
-      root = { name: formatFolderName(colKey), path: colKey, count: 0, children: new Map() };
-      roots.set(colKey, root);
+  contextMenu.hidden = false;
+  const anchor = at instanceof Element ? at.getBoundingClientRect() : null;
+  const { offsetWidth: width, offsetHeight: height } = contextMenu;
+  let left = anchor ? anchor.right - width : at.clientX;
+  let top = anchor ? anchor.bottom + 4 : at.clientY;
+  if (top + height > innerHeight - 8) top = (anchor ? anchor.top - 4 : at.clientY) - height;
+  contextMenu.style.left = `${Math.max(8, Math.min(left, innerWidth - width - 8))}px`;
+  contextMenu.style.top = `${Math.max(8, top)}px`;
+
+  const buttons = () => [...contextMenu.querySelectorAll(".menu-item:not(:disabled)")];
+  const onPointer = (event) => {
+    if (!contextMenu.contains(event.target)) closeMenu();
+  };
+  const onScroll = (event) => {
+    if (!contextMenu.contains(event.target)) closeMenu();
+  };
+  const onKey = (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMenu();
+    } else if (event.key === "ArrowDown" || event.key === "ArrowUp" || stepKey(event)) {
+      event.preventDefault();
+      const list = buttons();
+      const index = list.indexOf(document.activeElement);
+      const step = stepKey(event) || (event.key === "ArrowDown" ? 1 : -1);
+      const next = index < 0 ? (step > 0 ? 0 : list.length - 1) : (index + step + list.length) % list.length;
+      list[next]?.focus();
+    } else if (event.key === "Tab") {
+      closeMenu();
     }
-    root.count += 1;
+  };
+  document.addEventListener("pointerdown", onPointer, true);
+  document.addEventListener("keydown", onKey, true);
+  document.addEventListener("scroll", onScroll, true);
+  window.addEventListener("blur", closeMenu);
+  window.addEventListener("resize", closeMenu);
+  closeContextMenu = () => {
+    document.removeEventListener("pointerdown", onPointer, true);
+    document.removeEventListener("keydown", onKey, true);
+    document.removeEventListener("scroll", onScroll, true);
+    window.removeEventListener("blur", closeMenu);
+    window.removeEventListener("resize", closeMenu);
+    contextMenu.hidden = true;
+    closeContextMenu = null;
+  };
+  // Opened from a button: start on the first item. At the pointer, ↓ or ⌃N picks it.
+  if (anchor) buttons()[0]?.focus();
+}
 
-    // Build subfolder hierarchy
-    const parts = pathParts(doc.folder);
-    const subParts = parts.length > 0 && parts[0] === colKey ? parts.slice(1) : (colKey === "general" ? [] : parts);
+function closeMenu() {
+  closeContextMenu?.();
+}
 
-    let current = root;
-    for (const part of subParts) {
-      const childPath = `${current.path}/${part}`;
-      if (!current.children.has(part)) {
-        current.children.set(part, {
-          name: formatFolderName(part),
-          path: childPath,
-          count: 0,
-          children: new Map(),
-        });
+// Edit `element`'s text in place. `commit` gets the new text, "" if it was
+// cleared, or null if editing was cancelled with Escape.
+function editInline(element, text, commit, { selectAll = true } = {}) {
+  element.textContent = text;
+  element.contentEditable = "plaintext-only";
+  element.spellcheck = false;
+  element.focus();
+  const selection = getSelection();
+  selection.selectAllChildren(element);
+  if (!selectAll) selection.collapseToEnd();
+  let finished = false;
+  const finish = (save) => {
+    if (finished) return;
+    finished = true;
+    element.removeAttribute("contenteditable");
+    commit(save ? element.textContent.replace(/\s+/g, " ").trim() : null);
+  };
+  element.addEventListener("keydown", (event) => {
+    const step = stepKey(event);
+    if (event.key === "Enter" || step) {
+      event.preventDefault();
+      event.stopPropagation();
+      finish(true);
+      if (step) moveNav(step);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      finish(false);
+    }
+  });
+  element.addEventListener("blur", () => finish(true), { once: true });
+}
+
+// The ⋯ button beside the page title, for the folder or area on screen.
+let pageMenuItems = null;
+
+function setPageMenu(items) {
+  pageMenuItems = items;
+  pageMenuButton.hidden = !items;
+}
+
+// ── Moving through lists by keyboard ────────────────────────────────────────
+// As in Ergon: ⌃N/⌃P (or ↓/↑, j/k) select the next or previous line of the
+// list on screen (search results, a folder's notes, Explore),
+// Enter acts on it, and going past either end returns to the list's text
+// box. From a search box, the keys move through its results while you type.
+
+const nav = { scope: "", key: null, position: -1 };
+// What the keyboard can do to a row: { activate, edit, remove, move(step) }.
+// Rows without an entry are clicked to activate.
+const rowActions = new WeakMap();
+
+function stepKey(event) {
+  if (!event.ctrlKey || event.metaKey || event.altKey) return 0;
+  return { n: 1, p: -1 }[event.key.toLowerCase()] ?? 0;
+}
+
+function navScope() {
+  return `${state.view}|${state.folder}|${state.roadmapTopic}`;
+}
+
+function navRows() {
+  const container = { home: homeSuggestions, notes: noteList, roadmap: roadmapTopics }[state.view];
+  if (!container) return [];
+  return [...container.querySelectorAll(".home-result, .note-card, .plain-list .row")].filter((row) => row.offsetParent);
+}
+
+function rowKey(row) {
+  return row.dataset.key ?? row.dataset.path ?? "";
+}
+
+// Mark the selected row, finding it again (by key, else by position) after
+// its list is redrawn.
+function showNav() {
+  for (const row of document.querySelectorAll(".nav-selected")) row.classList.remove("nav-selected");
+  if (nav.scope !== navScope()) Object.assign(nav, { scope: navScope(), key: null, position: -1 });
+  const rows = navRows();
+  if (nav.position < 0 || !rows.length) {
+    nav.position = -1;
+    return null;
+  }
+  let index = nav.key === null ? -1 : rows.findIndex((row) => rowKey(row) === nav.key);
+  if (index < 0) index = Math.min(nav.position, rows.length - 1);
+  const row = rows[index];
+  Object.assign(nav, { key: rowKey(row), position: index });
+  row.classList.add("nav-selected");
+  row.scrollIntoView({ block: "nearest" });
+  return row;
+}
+
+function setNav(position, key = null) {
+  Object.assign(nav, { scope: navScope(), key, position });
+  return showNav();
+}
+
+function clearNav() {
+  setNav(-1);
+}
+
+const selectedRow = () => document.querySelector(".nav-selected");
+
+function moveNav(step) {
+  const rows = navRows();
+  const current = rows.findIndex((row) => row.classList.contains("nav-selected"));
+  const lastOpen = rows.findLastIndex((row) => !row.classList.contains("is-done"));
+  const last = lastOpen === -1 ? rows.length - 1 : lastOpen;
+  const next = current === -1 ? (step > 0 ? 0 : last) : current + step;
+  // Past either end of the list is its text box, and from there back round.
+  if (!rows[next]) {
+    clearNav();
+    focusListBox();
+    return;
+  }
+  // A link or button keeping the focus would take Enter for itself; a search box keeps it.
+  if (document.activeElement !== searchInput) document.activeElement?.blur?.();
+  document.body.classList.add("keyboard-nav");
+  setNav(next, rowKey(rows[next]));
+}
+
+// The text box that goes with the list on screen: the add box in Explore,
+// otherwise the search box.
+function listBox() {
+  if (state.view === "roadmap") return roadmapTopics.querySelector(".add-line .add-box");
+  return searchBar.hidden ? null : searchInput;
+}
+
+function focusListBox({ scroll = true } = {}) {
+  const box = listBox();
+  if (box === searchInput) box.focus();
+  else focusEnd(box, { scroll });
+}
+
+function activateRow(row) {
+  const actions = rowActions.get(row);
+  if (actions?.activate) actions.activate();
+  else row.click();
+}
+
+// Move the selected row up or down its list (Explore). A move returns false
+// if there's nowhere to go, or the row's new key when that changes.
+function moveSelectedRow(step) {
+  const row = selectedRow();
+  const move = row && rowActions.get(row)?.move;
+  if (!move) return;
+  const position = nav.position;
+  Object.assign(nav, { key: null, position: position + step });
+  const moved = move(step);
+  if (moved === false) Object.assign(nav, { position });
+  else if (typeof moved === "string") nav.key = moved;
+  showNav();
+}
+
+// Escape in a list view goes up a level, as the breadcrumb reads: an Explore
+// area to Explore, a folder to the folder it's in, and Explore or a topic to
+// the start page. False where there's nowhere up to go.
+function goUp() {
+  const toStartPage = () => {
+    if (switchToHome({ syncUrl: false, retry: toStartPage })) history.pushState(null, "", "/");
+  };
+  if (state.view === "roadmap") {
+    if (state.roadmapTopic) showAllRoadmapTopics();
+    else toStartPage();
+  } else if (state.view === "map") {
+    toStartPage();
+  } else if (state.view === "notes") {
+    const parent = parentPath(state.folder);
+    if (parent) openHomeFolder(parent);
+    else toStartPage();
+  } else {
+    return false;
+  }
+  return true;
+}
+
+// A mouse resting on a row should not look like a second selection.
+addEventListener("pointermove", (event) => {
+  if (event.movementX || event.movementY) document.body.classList.remove("keyboard-nav");
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented) return;
+  if (!helpOverlay.hidden) {
+    if (event.key === "Escape" || event.key === "?") {
+      event.preventDefault();
+      helpOverlay.hidden = true;
+    }
+    return;
+  }
+  if (noteViewer.open || document.querySelector("dialog[open]") || !contextMenu.hidden) return;
+  const step = stepKey(event);
+  if (event.target === searchInput) {
+    const arrow = event.metaKey || event.altKey || event.shiftKey ? 0 : { ArrowDown: 1, ArrowUp: -1 }[event.key] || 0;
+    if (step || arrow) {
+      event.preventDefault();
+      moveNav(step || arrow);
+    } else if (event.key === "Enter" && !event.isComposing) {
+      // Enter opens the selected result; on the home page, the top one if none is.
+      const row = selectedRow() || (state.view === "home" ? navRows()[0] : null);
+      if (row) {
+        event.preventDefault();
+        activateRow(row);
       }
-      current = current.children.get(part);
-      current.count += 1;
+    }
+    return;
+  }
+  const typing = event.target.closest?.("input, textarea, select, [contenteditable]");
+  if (step && !typing) {
+    event.preventDefault();
+    moveNav(step);
+    return;
+  }
+  if (typing || event.metaKey || event.ctrlKey) return;
+  if ((event.key === " " || event.key === "Enter") && event.target.closest?.("button, a")) return;
+  if (event.key === "?") {
+    event.preventDefault();
+    helpOverlay.hidden = false;
+    return;
+  }
+  // Roadmap's map has keys of its own; Esc puts away its selection first.
+  if (state.view === "map") {
+    if (event.key === "Escape") {
+      if (!clearMapSelection()) goUp();
+    } else {
+      mapKey(event);
+    }
+    return;
+  }
+  if (event.key === "Escape") {
+    if (!goUp()) clearNav();
+    return;
+  }
+  if (event.key === "n" && state.view === "roadmap") {
+    event.preventDefault();
+    // The box of the list the selected line is in (on a section's heading, the section's own).
+    const place = selectedRow()?.dataset.place;
+    const box = place && roadmapTopics.querySelector(`.add-line[data-place="${place}"] .add-box`);
+    if (box) focusEnd(box);
+    else focusListBox();
+    return;
+  }
+  const up = event.key === "ArrowUp" || event.key === "k";
+  const down = event.key === "ArrowDown" || event.key === "j";
+  if (up || down) {
+    event.preventDefault();
+    if (event.altKey) moveSelectedRow(down ? 1 : -1);
+    else moveNav(down ? 1 : -1);
+    return;
+  }
+  // A held key repeats, and these act on a different row each time.
+  const row = selectedRow();
+  if (!row || event.repeat) return;
+  const actions = rowActions.get(row) || {};
+  if (event.key === "Enter" || event.key === " " || (event.key === "x" && row.dataset.kind === "item")) {
+    event.preventDefault();
+    nav.key = null;
+    activateRow(row);
+  } else if (event.key === "e" && actions.edit) {
+    event.preventDefault();
+    actions.edit();
+  } else if ((event.key === "Backspace" || event.key === "Delete") && actions.remove) {
+    event.preventDefault();
+    nav.key = null;
+    actions.remove();
+  }
+});
+
+helpOverlay.addEventListener("click", (event) => {
+  if (event.target === helpOverlay) helpOverlay.hidden = true;
+});
+
+// ── Sidebar folders ──────────────────────────────────────────────────────────
+// Top-level folders are topics (state.collections); deeper ones come from
+// state.folders. Both can be created, renamed, dragged into a new order or
+// into another folder, and deleted once empty.
+
+let treeDrop = null;
+let treeExpandTimer = 0;
+
+function parentPath(path) {
+  return pathParts(path).slice(0, -1).join("/");
+}
+
+function folderLabel(path) {
+  const parts = pathParts(path);
+  if (parts.length <= 1) return state.collections[path] || formatFolderName(path);
+  return state.folderLabels.get(path) || formatFolderName(parts.at(-1));
+}
+
+function inFolder(doc, path) {
+  return doc.collection === path || doc.folder === path || doc.folder.startsWith(`${path}/`);
+}
+
+function applyCatalog(payload) {
+  state.documents = payload.documents;
+  state.collections = payload.collections || {};
+  state.folders = payload.folders || [];
+  state.folderLabels = new Map(state.folders.map((folder) => [folder.path, folder.label]));
+  if (!state.query) state.results = payload.documents;
+}
+
+async function reloadCatalog() {
+  const response = await fetch("/api/catalog", { cache: "no-store" });
+  if (!response.ok) throw new Error("Could not reload your notes.");
+  applyCatalog(await response.json());
+  if (state.selected) state.selected = state.documents.find((doc) => doc.path === state.selected.path) || state.selected;
+  buildFolderTree(state.documents);
+  highlightActiveFolder();
+  if (state.view === "notes") {
+    updateHeading();
+    if (state.query) await runSearch(state.query);
+    else updateList();
+  }
+}
+
+async function folderRequest(method, url, body) {
+  const response = await fetch(url, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "Could not change the folder.");
+  return result;
+}
+
+// After a folder moves, keep it open and selected under its new path.
+function remapFolder(oldPath, newPath) {
+  const remap = (path) => (path === oldPath || path.startsWith(`${oldPath}/`) ? newPath + path.slice(oldPath.length) : path);
+  state.expanded = new Set([...state.expanded].map(remap));
+  const folder = remap(state.folder);
+  if (folder !== state.folder) {
+    state.folder = folder;
+    if (new URLSearchParams(location.search).has("folder")) {
+      history.replaceState(null, "", `/?folder=${encodeURIComponent(folder)}`);
     }
   }
+}
 
-  folderTree.replaceChildren();
-  for (const node of roots.values()) {
-    folderTree.append(renderFolderNode(node, 0));
+async function createFolder(parent, name) {
+  try {
+    const result = await folderRequest("POST", "/api/folders", { parent, name });
+    if (parent) state.expanded.add(parent);
+    await reloadCatalog();
+    openHomeFolder(result.path);
+  } catch (error) {
+    showToast(error.message);
   }
+}
+
+async function renameFolder(path, label) {
+  if (pathParts(path).length === 1) state.collections[path] = label;
+  else state.folderLabels.set(path, label);
+  buildFolderTree(state.documents);
+  highlightActiveFolder();
+  if (state.view === "notes") updateHeading();
+  try {
+    await folderRequest("PATCH", "/api/folders", { path, label });
+  } catch (error) {
+    showToast(error.message);
+    await reloadCatalog().catch(() => {});
+  }
+}
+
+async function moveFolder(path, parent, before) {
+  try {
+    const result = await folderRequest("POST", "/api/folders/move", { path, parent, before });
+    remapFolder(path, result.path);
+    if (parent) state.expanded.add(parent);
+    await reloadCatalog();
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+async function deleteFolder(path) {
+  const label = folderLabel(path);
+  try {
+    await folderRequest("DELETE", `/api/folders?path=${encodeURIComponent(path)}`);
+    const wasOpen = state.folder === path || state.folder.startsWith(`${path}/`);
+    if (wasOpen) state.folder = parentPath(path);
+    await reloadCatalog();
+    if (wasOpen && state.view === "notes") {
+      if (state.folder) openHomeFolder(state.folder);
+      else selectAllNotes();
+    }
+    showToast(`Deleted “${label}”`);
+  } catch (error) {
+    showToast(error.message);
+  }
+}
+
+// A text box in a tree row for naming a folder. `onDone` gets the name, or ""
+// if it was left empty or cancelled.
+function nameInTree(row, value, onDone) {
+  const input = document.createElement("input");
+  input.className = "tree-input";
+  input.value = value;
+  input.maxLength = 100;
+  input.setAttribute("aria-label", "Folder name");
+  row.draggable = false;
+  row.append(input);
+  input.focus();
+  input.select();
+  let finished = false;
+  const finish = (name) => {
+    if (finished) return;
+    finished = true;
+    onDone(name.replace(/\s+/g, " ").trim());
+  };
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      finish(input.value);
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      finish("");
+    }
+  });
+  input.addEventListener("blur", () => finish(input.value));
+}
+
+function startNewFolder(parent) {
+  if (parent && !state.expanded.has(parent)) {
+    state.expanded.add(parent);
+    buildFolderTree(state.documents);
+    highlightActiveFolder();
+  }
+  let container = folderTree;
+  const parentItem = parent && folderTree.querySelector(`.tree-item[data-path="${CSS.escape(parent)}"]`);
+  if (parentItem) {
+    container = parentItem.querySelector(":scope > .tree-children");
+    if (!container) {
+      container = document.createElement("div");
+      container.className = "tree-children";
+      parentItem.append(container);
+      parentItem.classList.add("expanded");
+    }
+  }
+  const item = document.createElement("div");
+  item.className = "tree-item";
+  const row = document.createElement("div");
+  row.className = "tree-row";
+  const spacer = document.createElement("span");
+  spacer.className = "tree-toggle";
+  spacer.style.visibility = "hidden";
+  row.append(spacer);
+  item.append(row);
+  container.append(item);
+  row.scrollIntoView({ block: "nearest" });
+  nameInTree(row, "", (name) => {
+    item.remove();
+    if (name) createFolder(parent, name);
+  });
+}
+
+function renameFolderInTree(path) {
+  const row = folderTree.querySelector(`.tree-item[data-path="${CSS.escape(path)}"] > .tree-row`);
+  if (!row) return;
+  row.querySelector(".tree-name").hidden = true;
+  row.scrollIntoView({ block: "nearest" });
+  nameInTree(row, folderLabel(path), (label) => {
+    if (label && label !== folderLabel(path)) {
+      renameFolder(path, label);
+    } else {
+      buildFolderTree(state.documents);
+      highlightActiveFolder();
+    }
+  });
+}
+
+function folderMenu(path) {
+  const notes = state.documents.filter((doc) => inFolder(doc, path)).length;
+  const inbox = path === "inbox";
+  return [
+    { label: "New note", onPick: () => createNote({ title: "Untitled", collection: pathParts(path)[0], folder: path }) },
+    { label: "New note from a file…", onPick: () => createNoteFromPickedFile(path) },
+    { label: "New folder", onPick: () => startNewFolder(path) },
+    "-",
+    { label: "Rename", onPick: () => renameFolderInTree(path) },
+    {
+      label: "Delete",
+      danger: true,
+      disabled: inbox || notes > 0,
+      detail: notes ? `${notes} note${notes === 1 ? "" : "s"}` : "",
+      title: inbox ? "The Inbox stays" : notes ? "Move or delete its notes first" : "",
+      onPick: () => deleteFolder(path),
+    },
+  ];
+}
+
+function setAllExpanded(expanded) {
+  if (expanded) for (const item of folderTree.querySelectorAll(".tree-item[data-path]")) state.expanded.add(item.dataset.path);
+  else state.expanded.clear();
+  buildFolderTree(state.documents);
+  highlightActiveFolder();
+}
+
+function sidebarMenu() {
+  return [
+    { label: "New topic", onPick: () => startNewFolder("") },
+    "-",
+    { label: "Expand all", onPick: () => setAllExpanded(true) },
+    { label: "Collapse all", onPick: () => setAllExpanded(false) },
+  ];
+}
+
+function clearTreeDrop() {
+  for (const row of folderTree.querySelectorAll(".drop-target, .drop-before, .drop-after")) {
+    row.classList.remove("drop-target", "drop-before", "drop-after");
+  }
+  folderTree.classList.remove("drop-end");
+  window.clearTimeout(treeExpandTimer);
+  treeDrop = null;
+}
+
+function canHoldFolder(path, parent) {
+  return parent !== path && !parent.startsWith(`${path}/`) && !(path === "inbox" && parent);
+}
+
+function nextSiblingPath(path) {
+  const item = folderTree.querySelector(`.tree-item[data-path="${CSS.escape(path)}"]`);
+  return item?.nextElementSibling?.dataset.path || null;
+}
+
+// Where a folder dragged over `row` would go: before or after it (top or
+// bottom of the row) or inside it (the middle). Just below an open folder
+// means first inside it.
+function folderDropAt(row, clientY) {
+  const item = row.parentElement;
+  const path = item.dataset.path;
+  const rect = row.getBoundingClientRect();
+  const offset = (clientY - rect.top) / rect.height;
+  const zone = offset < 0.28 ? "before" : offset > 0.72 ? "after" : "into";
+  const firstChild = item.querySelector(":scope > .tree-children > .tree-item[data-path]");
+  if (zone === "into") return { zone, parent: path, before: null };
+  if (zone === "after" && item.classList.contains("expanded") && firstChild) {
+    return { zone, parent: path, before: firstChild.dataset.path };
+  }
+  return { zone, parent: parentPath(path), before: zone === "before" ? path : nextSiblingPath(path) };
+}
+
+function folderDropAllowed(dragged, drop) {
+  if (!canHoldFolder(dragged, drop.parent)) return false;
+  // Dropping where it already is changes nothing.
+  return !(drop.parent === parentPath(dragged) && (drop.before === dragged || drop.before === nextSiblingPath(dragged)));
+}
+
+folderTree.addEventListener("dragstart", (event) => {
+  const row = event.target.closest?.(".tree-row");
+  const path = row?.parentElement.dataset.path;
+  if (!path) return;
+  state.draggedFolderPath = path;
+  row.parentElement.classList.add("dragging");
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", folderLabel(path));
+});
+
+folderTree.addEventListener("dragend", () => {
+  folderTree.querySelector(".tree-item.dragging")?.classList.remove("dragging");
+  state.draggedFolderPath = "";
+  clearTreeDrop();
+});
+
+folderTree.addEventListener("dragover", (event) => {
+  const dragged = state.draggedFolderPath;
+  if (!dragged && !state.draggedNotePath) return;
+  const row = event.target.closest(".tree-row");
+  const path = row?.parentElement.dataset.path;
+  let drop = null;
+  if (path && !dragged) {
+    drop = { zone: "into", parent: path, note: true };
+  } else if (path) {
+    drop = folderDropAt(row, event.clientY);
+  } else if (dragged && !row && event.clientY > (folderTree.querySelector(":scope > .tree-item:last-child")?.getBoundingClientRect().bottom ?? 0)) {
+    drop = { zone: "end", parent: "", before: null };
+  }
+  if (drop && dragged && !folderDropAllowed(dragged, drop)) drop = null;
+  const key = drop && `${drop.zone} ${drop.parent} ${drop.before} ${path}`;
+  if (key !== treeDrop?.key) {
+    clearTreeDrop();
+    if (drop) {
+      treeDrop = { ...drop, key };
+      if (drop.zone === "end") folderTree.classList.add("drop-end");
+      else row.classList.add(drop.zone === "into" ? "drop-target" : `drop-${drop.zone}`);
+      const item = row?.parentElement;
+      if (drop.zone === "into" && item?.querySelector(":scope > .tree-children") && !item.classList.contains("expanded")) {
+        treeExpandTimer = window.setTimeout(() => {
+          state.expanded.add(path);
+          item.classList.add("expanded");
+        }, 700);
+      }
+    }
+  }
+  if (drop) {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+  }
+});
+
+// Leaving a row for its button also fires dragleave, so check the pointer
+// really left the tree (Chrome gives no relatedTarget here).
+folderTree.addEventListener("dragleave", (event) => {
+  const rect = folderTree.getBoundingClientRect();
+  if (event.clientX < rect.left || event.clientX >= rect.right || event.clientY < rect.top || event.clientY >= rect.bottom) {
+    clearTreeDrop();
+  }
+});
+
+folderTree.addEventListener("drop", (event) => {
+  const drop = treeDrop;
+  clearTreeDrop();
+  if (!drop) return;
+  event.preventDefault();
+  if (drop.note) {
+    const notePath = state.draggedNotePath || event.dataTransfer?.getData("text/plain");
+    state.draggedNotePath = "";
+    if (notePath) moveNoteToFolder(notePath, drop.parent);
+  } else {
+    moveFolder(state.draggedFolderPath, drop.parent, drop.before);
+  }
+});
+
+$(".sidebar").addEventListener("contextmenu", (event) => {
+  if (event.target.closest(".nav-group, .sidebar-footer, input")) return;
+  event.preventDefault();
+  const path = event.target.closest(".tree-item")?.dataset.path;
+  openMenu(event, path ? folderMenu(path) : sidebarMenu());
+});
+
+noteList.addEventListener("contextmenu", (event) => {
+  const card = event.target.closest(".note-card");
+  const doc = card && state.documents.find((candidate) => candidate.path === card.dataset.path);
+  if (!doc) return;
+  event.preventDefault();
+  openMenu(event, [
+    { label: "Open", onPick: () => selectDocument(doc) },
+    "-",
+    { label: "Delete", danger: true, onPick: () => deleteNote(doc.path) },
+  ]);
+});
+
+pageMenuButton.addEventListener("click", () => {
+  if (pageMenuItems) openMenu(pageMenuButton, pageMenuItems());
+});
+
+function buildFolderTree(documents) {
+  const nodes = new Map();
+  const roots = [];
+  const add = (path) => {
+    if (nodes.has(path)) return;
+    const node = { name: folderLabel(path), path, count: 0, children: [] };
+    nodes.set(path, node);
+    const parent = parentPath(path);
+    if (!parent) {
+      roots.push(node);
+      return;
+    }
+    add(parent);
+    nodes.get(parent).children.push(node);
+  };
+  for (const key of Object.keys(state.collections)) if (key !== FOLLOWING_TOPIC) add(key);
+  // Shallowest first, so a folder's position among its siblings comes from
+  // its own order rather than from when one of its subfolders turned up.
+  const byDepth = [...state.folders].sort((a, b) => pathParts(a.path).length - pathParts(b.path).length);
+  for (const folder of byDepth) add(folder.path);
+  for (const doc of documents) {
+    const collection = doc.collection || "general";
+    if (collection === FOLLOWING_TOPIC) continue;
+    const folder = pathParts(doc.folder)[0] === collection ? doc.folder : collection;
+    add(folder);
+    for (let path = folder; path; path = parentPath(path)) nodes.get(path).count += 1;
+  }
+  folderTree.replaceChildren(...roots.map((node) => renderFolderNode(node, 0)));
 }
 
 function renderFolderNode(node, depth) {
@@ -130,27 +874,15 @@ function renderFolderNode(node, depth) {
 
   const row = document.createElement("div");
   row.className = "tree-row";
+  row.draggable = true;
   if (state.folder === node.path) row.classList.add("selected");
-  row.addEventListener("dragover", (event) => {
-    if (!state.draggedNotePath) return;
-    event.preventDefault();
-    row.classList.add("drop-target");
-  });
-  row.addEventListener("dragleave", () => row.classList.remove("drop-target"));
-  row.addEventListener("drop", (event) => {
-    event.preventDefault();
-    row.classList.remove("drop-target");
-    const path = event.dataTransfer?.getData("text/plain") || state.draggedNotePath;
-    if (path) moveNoteToFolder(path, node.path);
-    state.draggedNotePath = "";
-  });
 
   const toggle = document.createElement("button");
   toggle.type = "button";
   toggle.className = "tree-toggle";
   toggle.setAttribute("aria-label", `Toggle ${node.name}`);
   toggle.innerHTML = chevronSvg;
-  if (!node.children.size) {
+  if (!node.children.length) {
     toggle.style.visibility = "hidden";
   } else {
     toggle.addEventListener("click", (event) => {
@@ -169,10 +901,11 @@ function renderFolderNode(node, depth) {
   nameBtn.type = "button";
   nameBtn.className = "tree-name";
   nameBtn.title = node.name;
-  nameBtn.innerHTML = `<span class="tree-symbol">${folderSvg}</span><span class="tree-title">${escapeHtml(node.name)}</span>`;
+  nameBtn.innerHTML = `<span class="tree-title">${escapeHtml(node.name)}</span>`;
   nameBtn.addEventListener("click", () => {
     openHomeFolder(node.path);
   });
+  nameBtn.addEventListener("dblclick", () => renameFolderInTree(node.path));
 
   const countSpan = document.createElement("span");
   countSpan.className = "tree-count";
@@ -181,11 +914,10 @@ function renderFolderNode(node, depth) {
   row.append(toggle, nameBtn, countSpan);
   wrapper.append(row);
 
-  if (node.children.size) {
+  if (node.children.length) {
     const childrenContainer = document.createElement("div");
     childrenContainer.className = "tree-children";
-    const sortedChildren = [...node.children.values()].sort((a, b) => a.name.localeCompare(b.name));
-    for (const child of sortedChildren) {
+    for (const child of node.children) {
       childrenContainer.append(renderFolderNode(child, depth + 1));
     }
     wrapper.append(childrenContainer);
@@ -199,8 +931,6 @@ function highlightActiveFolder() {
     row.classList.remove("selected");
   }
   navRoadmap.classList.toggle("active", state.view === "roadmap");
-  navProjects.classList.toggle("active", state.view === "projects");
-  navFollowing.classList.toggle("active", state.view === "following");
   navSearch.classList.toggle("active", state.view === "home");
   if (state.view === "home") navSearch.setAttribute("aria-current", "page");
   else navSearch.removeAttribute("aria-current");
@@ -217,13 +947,13 @@ function setHomePresentation(isHome) {
   homeHeading.hidden = !isHome;
   homeSuggestions.hidden = !isHome;
   searchBar.classList.toggle("home-search-bar", isHome);
-  $("#search-input").placeholder = isHome ? "Search topics and notes" : "Search notes";
-  $("#search-input").setAttribute("aria-label", isHome ? "Search topics and notes" : "Search notes");
+  $("#search-input").placeholder = isHome ? "Search notes, topics, and Explore" : "Search notes";
+  $("#search-input").setAttribute("aria-label", isHome ? "Search notes, topics, and Explore" : "Search notes");
   if (!isHome) homeSuggestions.replaceChildren();
 }
 
-function switchToHome({ syncUrl = true, focus = true } = {}) {
-  if (!confirmDiscardEditor()) return false;
+function switchToHome({ syncUrl = true, focus = true, retry = null } = {}) {
+  if (!confirmDiscardEditor(retry || (() => switchToHome({ syncUrl, focus })))) return false;
   window.clearTimeout(state.searchTimer);
   state.searchTimer = null;
   clearReader();
@@ -238,21 +968,23 @@ function switchToHome({ syncUrl = true, focus = true } = {}) {
   searchBar.hidden = false;
   workspaceGrid.hidden = true;
   roadmapView.hidden = true;
-  projectsView.hidden = true;
-  followingView.hidden = true;
+  showMapView(false);
   navRoadmap.classList.remove("active");
-  navProjects.classList.remove("active");
-  navFollowing.classList.remove("active");
   highlightActiveFolder();
   setHomePresentation(true);
   if (syncUrl) history.replaceState(null, "", "/");
-  if (focus) requestAnimationFrame(() => $("#search-input").focus());
+  // Focus now, so typing right after ⌘L lands in the box, and again next frame
+  // in case closing a note hands focus back to what it came from.
+  if (focus) {
+    searchInput.focus();
+    requestAnimationFrame(() => searchInput.focus());
+  }
   return true;
 }
 
 function getVisibleDocuments() {
   const base = state.query ? state.results : state.documents;
-  if (!state.folder) return base;
+  if (!state.folder) return base.filter((doc) => doc.collection !== FOLLOWING_TOPIC);
 
   return base.filter((doc) => {
     if (state.folder === "general") {
@@ -267,14 +999,13 @@ function getVisibleDocuments() {
 
 function updateHeading() {
   let title = "Notes";
-  if (state.folder) {
-    const parts = state.folder.split("/");
-    title = parts.length === 1 && state.collections[parts[0]]
-      ? state.collections[parts[0]]
-      : formatFolderName(parts.at(-1));
-  }
+  if (state.folder) title = folderLabel(state.folder);
 
   $("#page-title").textContent = title;
+  const scope = state.folder ? `Search in ${title}` : "Search all notes";
+  $("#search-input").placeholder = scope;
+  $("#search-input").setAttribute("aria-label", scope);
+  setPageMenu(state.folder && state.folder !== "general" ? () => folderMenu(state.folder) : null);
   // Build clickable breadcrumbs
   const breadcrumb = $("#breadcrumb");
   breadcrumb.replaceChildren();
@@ -282,7 +1013,7 @@ function updateHeading() {
   const rootLink = document.createElement("a");
   rootLink.className = "breadcrumb-item";
   rootLink.href = "#";
-  rootLink.textContent = "ZETESIS";
+  rootLink.textContent = "Zetesis";
   rootLink.addEventListener("click", (e) => {
     e.preventDefault();
     selectAllNotes();
@@ -302,9 +1033,7 @@ function updateHeading() {
       sep.textContent = "/";
       breadcrumb.append(sep);
 
-      const label = i === 0 && state.collections[part]
-        ? state.collections[part].toUpperCase()
-        : formatFolderName(part).toUpperCase();
+      const label = folderLabel(targetPath);
 
       if (i === parts.length - 1) {
         const cur = document.createElement("span");
@@ -318,7 +1047,7 @@ function updateHeading() {
         link.textContent = label;
         link.addEventListener("click", (e) => {
           e.preventDefault();
-          if (!confirmDiscardEditor()) return;
+          if (!confirmDiscardEditor(() => link.click())) return;
           state.folder = targetPath;
           state.expanded.add(targetPath);
           highlightActiveFolder();
@@ -334,38 +1063,27 @@ function updateHeading() {
     sep.textContent = "/";
     const cur = document.createElement("span");
     cur.className = "breadcrumb-current";
-    cur.textContent = "NOTES";
+    cur.textContent = "Notes";
     breadcrumb.append(sep, cur);
   }
 }
 
-const ROADMAP_LINK_ACTIONS = {
-  video: "Watch video",
-  podcast: "Listen to podcast",
-  book: "Open resource",
-};
-
-function switchToNotes({ syncUrl = true } = {}) {
-  if (!confirmDiscardEditor()) return false;
+function switchToNotes({ syncUrl = true, retry = null } = {}) {
+  if (!confirmDiscardEditor(retry || (() => switchToNotes({ syncUrl })))) return false;
   clearReader({ resetUrl: true });
   const leavingRoadmap = state.view === "roadmap";
-  const leavingProjects = state.view === "projects";
-  const leavingFollowing = state.view === "following";
   state.view = "notes";
   state.roadmapTopicFromIndex = false;
   setHomePresentation(false);
   roadmapView.hidden = true;
-  projectsView.hidden = true;
-  followingView.hidden = true;
+  showMapView(false);
   searchBar.hidden = false;
   workspaceGrid.hidden = false;
   navRoadmap.classList.remove("active");
-  navProjects.classList.remove("active");
-  navFollowing.classList.remove("active");
   highlightActiveFolder();
   updateHeading();
 
-  if ((leavingRoadmap || leavingProjects || leavingFollowing) && syncUrl) {
+  if (leavingRoadmap && syncUrl) {
     const url = state.selected ? `/?note=${encodeURIComponent(state.selected.path)}` : "/";
     history.replaceState(null, "", url);
   }
@@ -373,57 +1091,54 @@ function switchToNotes({ syncUrl = true } = {}) {
 }
 
 function editorHasUnsavedChanges() {
-  const article = $(".note-inline-editor");
-  const title = $(".reader-title-editor");
   const session = state.editorSession;
-  if (!article || !title || !session || session.path !== state.selected?.path) return false;
-  return article.innerHTML !== session.initialMarkup || title.value !== session.title;
+  return Boolean(session) && (noteSessionIsDirty(session) || Boolean(session.inFlight));
 }
 
-function confirmDiscardEditor() {
-  return !editorHasUnsavedChanges() || window.confirm("Discard your unsaved edits?");
-}
-
-function roadmapItemMatches(item) {
-  const filter = state.roadmapFilter;
-  if (!filter || filter === "all") return true;
-  if (filter === "next") return String(item.status || "").toUpperCase() === "NEXT";
-  return String(item.type || "").toLowerCase() === filter;
+// Leaving a note saves its pending edits in the background (see
+// closeEditorSession); only ask when leaving would actually lose something.
+// True when it's fine to go. Otherwise it asks, in the app (which can't hold
+// up the caller), returns false, and runs `retry` if you choose to leave.
+function confirmDiscardEditor(retry = null) {
+  const session = state.editorSession;
+  if (!session || session.leaveApproved) return true;
+  const losses = [];
+  if (session.controller?.hasPendingUploads()) losses.push("A file is still uploading into this note, and the upload will be lost.");
+  if (session.conflict && noteSessionIsDirty(session)) {
+    losses.push("This note was changed elsewhere, so your latest edits weren't saved and will be lost.");
+  }
+  if (!losses.length) return true;
+  if (!askAnswer) {
+    askConfirm({ title: "Leave this note?", message: losses.join(" "), confirmLabel: "Leave anyway", danger: true })
+      .then((leave) => {
+        if (!leave || state.editorSession !== session) return;
+        session.leaveApproved = true;
+        retry?.();
+        session.leaveApproved = false;
+      });
+  }
+  return false;
 }
 
 function updateRoadmapCounts() {
-  const totals = { all: 0, next: 0, book: 0, podcast: 0, video: 0, idea: 0 };
-  for (const topic of state.roadmap?.topics || []) {
-    for (const item of topic.items || []) {
-      totals.all += 1;
-      const type = String(item.type || "").toLowerCase();
-      if (type in totals) totals[type] += 1;
-      if (String(item.status || "").toUpperCase() === "NEXT") totals.next += 1;
-    }
-  }
-
-  $("#roadmap-count").textContent = String(totals.all);
-  for (const [key, value] of Object.entries(totals)) {
-    const badge = $(`#pill-${key}-count`);
-    if (badge) badge.textContent = String(value);
-  }
+  $("#roadmap-count").textContent = String(exploreAreas().reduce((count, area) => count + openCount(area), 0));
 }
 
 function updateRoadmapHeading() {
   const selectedTopic = state.roadmapTopic;
 
-  if (selectedTopic) {
-    $("#page-title").textContent = selectedTopic;
-  } else {
-    $("#page-title").textContent = "Up Next";
-  }
+  $("#page-title").textContent = selectedTopic || "Explore";
+  const areaIndex = exploreAreas().findIndex((area) => area.name === selectedTopic);
+  setPageMenu(selectedTopic && areaIndex >= 0
+    ? () => [{ label: "New section", onPick: () => startNewSection([areaIndex]) }, ...areaMenu(areaIndex).filter((item) => item.label !== "Open")]
+    : null);
   const breadcrumb = $("#breadcrumb");
   breadcrumb.replaceChildren();
 
   const rootLink = document.createElement("a");
   rootLink.className = "breadcrumb-item";
   rootLink.href = "#";
-  rootLink.textContent = "ZETESIS";
+  rootLink.textContent = "Zetesis";
   rootLink.addEventListener("click", (event) => {
     event.preventDefault();
     selectAllNotes();
@@ -434,22 +1149,22 @@ function updateRoadmapHeading() {
   separator.textContent = "/";
 
   if (selectedTopic) {
-    const upNextLink = document.createElement("a");
-    upNextLink.className = "breadcrumb-item";
-    upNextLink.href = "#";
-    upNextLink.textContent = "UP NEXT";
-    upNextLink.addEventListener("click", (e) => {
+    const exploreLink = document.createElement("a");
+    exploreLink.className = "breadcrumb-item";
+    exploreLink.href = "#";
+    exploreLink.textContent = "Explore";
+    exploreLink.addEventListener("click", (e) => {
       e.preventDefault();
       showAllRoadmapTopics();
     });
     const current = document.createElement("span");
     current.className = "breadcrumb-current";
-    current.textContent = selectedTopic.toUpperCase();
-    breadcrumb.append(rootLink, separator, upNextLink, separator.cloneNode(true), current);
+    current.textContent = selectedTopic;
+    breadcrumb.append(rootLink, separator, exploreLink, separator.cloneNode(true), current);
   } else {
     const current = document.createElement("span");
     current.className = "breadcrumb-current";
-    current.textContent = "UP NEXT";
+    current.textContent = "Explore";
     breadcrumb.append(rootLink, separator, current);
   }
 }
@@ -461,6 +1176,7 @@ function openRoadmapTopic(topicName) {
   history.pushState(null, "", `/?${params.toString()}`);
   updateRoadmapHeading();
   renderRoadmap();
+  focusListBox({ scroll: false });
 }
 
 function showAllRoadmapTopics() {
@@ -469,19 +1185,17 @@ function showAllRoadmapTopics() {
   history.pushState(null, "", "/?view=roadmap");
   updateRoadmapHeading();
   renderRoadmap();
+  focusListBox({ scroll: false });
 }
 
 async function loadRoadmap({ force = false } = {}) {
   if (state.roadmap && !force) return state.roadmap;
 
   const response = await fetch("/api/roadmap", { cache: "no-store" });
-  if (!response.ok) throw new Error("Could not load the roadmap.");
+  if (!response.ok) throw new Error("Could not load Explore.");
   const payload = await response.json();
 
-  state.roadmap = {
-    topics: Array.isArray(payload.topics) ? payload.topics : [],
-    counts: payload.counts || {},
-  };
+  state.roadmap = { areas: Array.isArray(payload.areas) ? payload.areas : [] };
   updateRoadmapCounts();
   return state.roadmap;
 }
@@ -508,7 +1222,7 @@ function roadmapErrorState(message) {
 }
 
 async function switchToRoadmap({ topic = "", syncUrl = true } = {}) {
-  if (!confirmDiscardEditor()) return;
+  if (!confirmDiscardEditor(() => switchToRoadmap({ topic, syncUrl }))) return;
   clearReader();
   state.view = "roadmap";
   navSearch.classList.remove("active");
@@ -518,11 +1232,8 @@ async function switchToRoadmap({ topic = "", syncUrl = true } = {}) {
   searchBar.hidden = true;
   workspaceGrid.hidden = true;
   roadmapView.hidden = false;
-  projectsView.hidden = true;
-  followingView.hidden = true;
+  showMapView(false);
   navRoadmap.classList.add("active");
-  navProjects.classList.remove("active");
-  navFollowing.classList.remove("active");
   for (const row of folderTree.querySelectorAll(".tree-row.selected")) {
     row.classList.remove("selected");
   }
@@ -533,8 +1244,10 @@ async function switchToRoadmap({ topic = "", syncUrl = true } = {}) {
   }
   updateRoadmapHeading();
 
+  // As in Ergon, the cursor starts in the add box, with the page at its top.
   if (state.roadmap) {
     renderRoadmap();
+    focusListBox({ scroll: false });
     return;
   }
 
@@ -542,6 +1255,7 @@ async function switchToRoadmap({ topic = "", syncUrl = true } = {}) {
   try {
     await loadRoadmap();
     renderRoadmap();
+    focusListBox({ scroll: false });
   } catch (error) {
     roadmapTopics.replaceChildren(roadmapErrorState(error.message));
     showToast(error.message);
@@ -549,40 +1263,51 @@ async function switchToRoadmap({ topic = "", syncUrl = true } = {}) {
 }
 
 
-const PROJECT_STATUS_LABELS = {
-  planned: "Planned",
-  active: "Active",
-  on_hold: "On hold",
-  completed: "Completed",
-  archived: "Archived",
-};
+// ── Roadmap ─────────────────────────────────────────────────────────────────
+// A map of boxes joined by arrows, like a mind map (map.js). It fills the main
+// area under the page's title; ⌘F there finds boxes, dimming the others.
 
-const TASK_STATUS_LABELS = {
-  todo: "To do",
-  in_progress: "In progress",
-  blocked: "Blocked",
-  done: "Done",
-};
-
-async function loadProjects({ force = false } = {}) {
-  if (state.projects && !force) return state.projects;
-  const response = await fetch("/api/projects", { cache: "no-store" });
-  if (!response.ok) throw new Error("Could not load projects.");
-  const payload = await response.json();
-  state.projects = Array.isArray(payload.projects) ? payload.projects : [];
-  $("#projects-count").textContent = String(state.projects.length);
-  return state.projects;
+function switchToMap({ syncUrl = true } = {}) {
+  if (!confirmDiscardEditor(() => switchToMap({ syncUrl }))) return;
+  clearReader();
+  state.view = "map";
+  state.query = "";
+  searchInput.value = "";
+  $("#clear-search").hidden = true;
+  navSearch.classList.remove("active");
+  navSearch.removeAttribute("aria-current");
+  navRoadmap.classList.remove("active");
+  setHomePresentation(false);
+  searchBar.hidden = true;
+  workspaceGrid.hidden = true;
+  roadmapView.hidden = true;
+  for (const row of folderTree.querySelectorAll(".tree-row.selected")) {
+    row.classList.remove("selected");
+  }
+  if (syncUrl) history.replaceState(null, "", "/?view=map");
+  updateMapHeading();
+  showMapView(true);
+  // The map's keys work from the start.
+  document.activeElement?.blur?.();
+  openMap();
 }
 
-function updateProjectsHeading() {
-  $("#page-title").textContent = "Projects";
-  const breadcrumb = $("#breadcrumb");
-  breadcrumb.replaceChildren();
-  const root = document.createElement("a");
-  root.className = "breadcrumb-item";
-  root.href = "#";
-  root.textContent = "ZETESIS";
-  root.addEventListener("click", (event) => {
+function showMapView(shown) {
+  if (!shown && !mapEl.hidden) closeMap();
+  mapEl.hidden = !shown;
+  mapZoom.hidden = !shown;
+  navMap.classList.toggle("active", shown);
+  document.body.classList.toggle("map-mode", shown);
+}
+
+function updateMapHeading() {
+  $("#page-title").textContent = "Roadmap";
+  setPageMenu(null);
+  const rootLink = document.createElement("a");
+  rootLink.className = "breadcrumb-item";
+  rootLink.href = "#";
+  rootLink.textContent = "Zetesis";
+  rootLink.addEventListener("click", (event) => {
     event.preventDefault();
     selectAllNotes();
   });
@@ -591,1233 +1316,1132 @@ function updateProjectsHeading() {
   separator.textContent = "/";
   const current = document.createElement("span");
   current.className = "breadcrumb-current";
-  current.textContent = "PROJECTS";
-  breadcrumb.append(root, separator, current);
+  current.textContent = "Roadmap";
+  $("#breadcrumb").replaceChildren(rootLink, separator, current);
 }
 
-async function loadFollowing({ force = false } = {}) {
-  if (state.following && !force) return state.following;
-  const response = await fetch("/api/following", { cache: "no-store" });
-  if (!response.ok) throw new Error("Could not load Following.");
-  const payload = await response.json();
-  state.following = Array.isArray(payload.items) ? payload.items : [];
-  return state.following;
+function openMapFind() {
+  searchBar.hidden = false;
+  searchInput.placeholder = "Find boxes";
+  searchInput.setAttribute("aria-label", "Find boxes");
+  searchInput.focus();
+  searchInput.select();
+  renderMap();
 }
 
-function updateFollowingHeading() {
-  $("#page-title").textContent = "Following";
-  const breadcrumb = $("#breadcrumb");
-  breadcrumb.replaceChildren();
-  const root = document.createElement("a");
-  root.className = "breadcrumb-item";
-  root.href = "#";
-  root.textContent = "ZETESIS";
-  root.addEventListener("click", (event) => {
-    event.preventDefault();
-    selectAllNotes();
-  });
-  const separator = document.createElement("span");
-  separator.className = "breadcrumb-separator";
-  separator.textContent = "/";
-  const current = document.createElement("span");
-  current.className = "breadcrumb-current";
-  current.textContent = "FOLLOWING";
-  breadcrumb.append(root, separator, current);
+function closeMapFind() {
+  searchInput.value = "";
+  $("#clear-search").hidden = true;
+  searchBar.hidden = true;
+  searchInput.blur();
+  renderMap();
 }
 
-function renderFollowingCard(item) {
-  const card = document.createElement("article");
-  card.className = "following-card";
-  const heading = document.createElement("h2");
-  heading.className = "following-title";
-  const link = document.createElement("a");
-  link.href = item.url;
-  link.target = "_blank";
-  link.rel = "noopener noreferrer";
-  link.textContent = item.title;
-  link.title = item.title;
-  heading.append(link);
-  const url = document.createElement("p");
-  url.className = "following-url";
-  try { url.textContent = new URL(item.url).hostname; } catch { url.textContent = item.url; }
-  card.append(heading, url);
-  if (item.description) {
-    const description = document.createElement("p");
-    description.className = "following-description";
-    description.textContent = item.description;
-    card.append(description);
+// Following is one note, in a topic of its own that the sidebar shows as this
+// entry. It opens over whatever is on screen, and is made again if deleted.
+const FOLLOWING_TOPIC = "following";
+
+async function openFollowingNote() {
+  if (!confirmDiscardEditor(openFollowingNote)) return;
+  let note = state.documents.find((doc) => doc.collection === FOLLOWING_TOPIC);
+  if (!note) {
+    try {
+      const response = await fetch("/api/notes", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "Following", collection: FOLLOWING_TOPIC, folder: FOLLOWING_TOPIC }),
+      });
+      note = await response.json();
+      if (!response.ok) throw new Error(note.error || "Could not create the Following note.");
+      state.documents.unshift(note);
+    } catch (error) {
+      showToast(error.message);
+      return;
+    }
   }
-  const actions = document.createElement("div");
-  actions.className = "following-card-actions";
-  const edit = document.createElement("button");
-  edit.type = "button";
-  edit.textContent = "Edit";
-  edit.addEventListener("click", () => openFollowingDialog(item));
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "following-delete";
-  remove.textContent = "Delete";
-  remove.addEventListener("click", () => deleteFollowingItem(item));
-  actions.append(edit, remove);
-  card.append(actions);
-  return card;
+  history.pushState(null, "", noteUrl(note.path));
+  selectDocument(note);
 }
 
-function renderFollowing() {
-  if (!state.following) return;
-  updateFollowingHeading();
-  for (const button of $("#following-filters").querySelectorAll(".following-filter")) {
-    button.classList.toggle("active", button.dataset.kind === state.followingFilter);
+// The address with a note open, keeping what's under it (a folder, or Explore),
+// so closing the note goes back there.
+function noteUrl(path) {
+  const params = new URLSearchParams(location.search);
+  params.set("note", path);
+  return `/?${params}`;
+}
+
+// ── Plain lists (Explore), worked like Ergon's task lists ───────────────────
+// Each line is a row; the add box at the bottom wraps like the line it will
+// become; Explore items are edited in place with their links kept as links.
+
+// [[address][words]] (address may be a Zetesis note, file:...), or a bare web address.
+const TITLE_LINK = /\[\[((?:https?|file):[^\]]+)\](?:\[([^\]]*)\])?\]|https?:\/\/[^\s<>)\]]*[^\s<>)\].,;:!?'"]/g;
+const WEB_ADDRESS = /^https?:\/\/[^\s\]]+$/;
+// Text typed in add boxes, kept while the list is redrawn: list name → text.
+const drafts = new Map();
+let rowDrag = null;
+
+// A title as it reads, without its link markup.
+function plainTitle(text) {
+  return text.replace(TITLE_LINK, (match, target, words) => words || target || match);
+}
+
+function showLinks(element, text) {
+  const parts = [];
+  let end = 0;
+  for (const match of text.matchAll(TITLE_LINK)) {
+    const target = match[1] ?? match[0];
+    const note = target.startsWith("file:") ? resolveRelativeTarget(target, "roadmap.org") : "";
+    const link = document.createElement("a");
+    link.href = note ? `/?note=${encodeURIComponent(note)}` : target;
+    link.dataset.target = target;
+    link.textContent = match[2] || match[1] || match[0];
+    if (!note) {
+      link.target = "_blank";
+      link.rel = "noopener noreferrer";
+    }
+    link.draggable = false;
+    parts.push(text.slice(end, match.index), link);
+    end = match.index + match[0].length;
   }
-  followingList.replaceChildren();
-  const items = state.following.filter((item) => state.followingFilter === "all" || item.kind === state.followingFilter);
-  if (!items.length) {
-    const empty = document.createElement("div");
-    empty.className = "following-empty";
-    empty.textContent = "No links here yet.";
-    followingList.append(empty);
+  element.replaceChildren(...parts, text.slice(end));
+}
+
+// A title as stored: links written [[address][words]], or the bare address when that is all they show.
+function titleMarkup(element) {
+  return typedMarkup(element).replace(/\s+/g, " ").trim();
+}
+
+// The same, with the spaces left as typed (for a draft still being written).
+function typedMarkup(element) {
+  const walk = (node) => {
+    if (node.nodeType === Node.TEXT_NODE) return node.data;
+    if (node.nodeName === "BR") return " ";
+    const inner = [...node.childNodes].map(walk).join("");
+    const target = node.nodeName === "A" && (node.dataset.target || node.getAttribute("href"));
+    const [, before, label, after] = inner.match(/^(\s*)([\s\S]*?)(\s*)$/);
+    if (!target || !label) return inner;
+    return before + (label === target ? target : `[[${target}][${label}]]`) + after;
+  };
+  return [...element.childNodes].map(walk).join("");
+}
+
+// Add boxes wrap like the lines they become, but a line is still one line of text.
+function submitOnEnter(event) {
+  if (event.key !== "Enter" || event.isComposing) return;
+  event.preventDefault();
+  event.target.closest("form").requestSubmit();
+}
+
+// Pastes come in as one line. A web address pasted over selected words links
+// them (where links are allowed).
+function pasteOneLine(event, { links = true } = {}) {
+  event.preventDefault();
+  const text = event.clipboardData.getData("text/plain");
+  if (links && WEB_ADDRESS.test(text.trim()) && getSelection().toString().trim()) {
+    document.execCommand("createLink", false, text.trim());
     return;
   }
-  for (const item of items) followingList.append(renderFollowingCard(item));
+  document.execCommand("insertText", false, text.replace(/\s+/g, " "));
 }
 
-async function switchToFollowing({ syncUrl = true } = {}) {
-  if (!confirmDiscardEditor()) return;
-  clearReader();
-  state.view = "following";
-  navSearch.classList.remove("active");
-  navSearch.removeAttribute("aria-current");
-  setHomePresentation(false);
-  state.folder = "";
-  state.query = "";
-  $("#search-input").value = "";
-  $("#clear-search").hidden = true;
-  searchBar.hidden = true;
-  roadmapView.hidden = true;
-  projectsView.hidden = true;
-  followingView.hidden = false;
-  workspaceGrid.hidden = true;
-  navRoadmap.classList.remove("active");
-  navProjects.classList.remove("active");
-  navFollowing.classList.add("active");
-  for (const row of folderTree.querySelectorAll(".tree-row.selected")) row.classList.remove("selected");
-  if (syncUrl) history.replaceState(null, "", "/?view=following");
-  updateFollowingHeading();
-  followingList.replaceChildren(roadmapMessage("Loading…"));
-  try {
-    await loadFollowing();
-    renderFollowing();
-  } catch (error) {
-    followingList.replaceChildren(roadmapMessage(error.message));
-  }
+// Set an add box's text, showing its links as links. Like setting a text
+// box's value, this leaves nothing to undo.
+function setBoxText(box, text) {
+  if (box.dataset.links) showLinks(box, text);
+  else box.textContent = text;
+  box.classList.toggle("is-empty", !box.textContent);
+  if (editHistory.host === box) editHistory.host = null;
 }
 
-function openFollowingDialog(item = null) {
-  $("#following-dialog-title").textContent = item ? "Edit link" : "Add link";
-  $("#following-id").value = item?.id || "";
-  $("#following-title").value = item?.title || "";
-  $("#following-url").value = item?.url || "";
-  $("#following-kind").value = item?.kind || "site";
-  $("#following-description").value = item?.description || "";
-  $("#save-following-item").textContent = item ? "Save link" : "Add link";
-  $("#delete-following-item").hidden = !item;
-  $("#following-dialog").showModal();
-  $("#following-title").focus();
-  if (!item) $("#following-title").select();
-}
-
-async function saveFollowingItem(event) {
-  event.preventDefault();
-  const id = $("#following-id").value;
-  const fields = {
-    title: $("#following-title").value.trim(),
-    url: $("#following-url").value.trim(),
-    kind: $("#following-kind").value,
-    description: $("#following-description").value.trim(),
-  };
-  try {
-    const response = await fetch(id ? "/api/following?id=" + encodeURIComponent(id) : "/api/following", {
-      method: id ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(fields),
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not save link.");
-    if ($("#following-dialog").open) $("#following-dialog").close();
-    await loadFollowing({ force: true });
-    renderFollowing();
-    showToast(id ? "Link updated" : "Link added");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function deleteFollowingItem(item) {
-  if (!window.confirm("Delete “" + item.title + "” from Following?")) return;
-  try {
-    const response = await fetch("/api/following?id=" + encodeURIComponent(item.id), { method: "DELETE" });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not delete link.");
-    if ($("#following-dialog").open) $("#following-dialog").close();
-    await loadFollowing({ force: true });
-    renderFollowing();
-    showToast("Link deleted");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-function createStatusSelect(className, options, current, ariaLabel) {
-  const select = document.createElement("select");
-  select.className = className;
-  select.setAttribute("aria-label", ariaLabel);
-  for (const [value, label] of Object.entries(options)) {
-    const option = document.createElement("option");
-    option.value = value;
-    option.textContent = label;
-    select.append(option);
-  }
-  select.value = current;
-  return select;
-}
-
-function renderProjectTask(task, project) {
-  const row = document.createElement("li");
-  row.className = "project-task" + (task.status === "done" ? " done" : "");
-
-  const title = document.createElement("input");
-  title.type = "text";
-  title.className = "project-task-title";
-  title.value = task.title;
-  title.maxLength = 500;
-  title.setAttribute("aria-label", "Task title");
-  title.addEventListener("keydown", (event) => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      title.blur();
-    } else if (event.key === "Escape") {
-      title.value = task.title;
-      title.blur();
-    }
+// Where links are allowed, the box is edited like an item (links shown as
+// links, not markup); otherwise it takes plain text.
+function addLineRow(placeholder, onAdd, { draft, links = false, maxLength = 100 } = {}) {
+  const form = document.createElement("form");
+  form.className = "add-row add-line";
+  form.dataset.draft = draft;
+  form.innerHTML = '<span class="add-mark" aria-hidden="true">+</span><div class="add-box" role="textbox"></div>';
+  const box = form.querySelector(".add-box");
+  box.contentEditable = links ? "true" : "plaintext-only";
+  box.spellcheck = false;
+  box.dataset.placeholder = placeholder;
+  box.setAttribute("aria-label", placeholder);
+  box.dataset.links = links ? "1" : "";
+  setBoxText(box, drafts.get(draft) ?? "");
+  box.addEventListener("input", () => {
+    box.classList.toggle("is-empty", !box.textContent);
+    if (box.textContent) drafts.set(draft, typedMarkup(box));
+    else drafts.delete(draft);
   });
-  title.addEventListener("blur", () => {
-    const nextTitle = title.value.trim();
-    if (nextTitle && nextTitle !== task.title) updateProjectTask(task.id, { title: nextTitle });
-    else title.value = task.title;
-  });
-
-  const status = createStatusSelect("task-status-select", TASK_STATUS_LABELS, task.status, "Task status");
-  status.addEventListener("change", () => updateProjectTask(task.id, { status: status.value }));
-
-  const remove = document.createElement("button");
-  remove.type = "button";
-  remove.className = "task-delete-button";
-  remove.title = "Delete task";
-  remove.setAttribute("aria-label", "Delete task");
-  remove.textContent = "×";
-  remove.addEventListener("click", () => deleteProjectTask(task, project));
-
-  row.append(title, status, remove);
-  return row;
-}
-
-function renderProjectCard(project) {
-  const card = document.createElement("article");
-  card.className = "project-card" + (project.status === "archived" ? " archived" : "");
-
-  const header = document.createElement("div");
-  header.className = "project-card-header";
-  const heading = document.createElement("div");
-  heading.className = "project-copy";
-  const title = document.createElement("h2");
-  title.className = "project-title";
-  title.textContent = project.title;
-  heading.append(title);
-
-  if (project.description) {
-    const description = document.createElement("p");
-    description.className = "project-description";
-    description.innerHTML = project.description
-      .split(/\r?\n/)
-      .map((line) => renderInline(line, ""))
-      .join("<br>");
-    heading.append(description);
-  }
-
-  const actions = document.createElement("div");
-  actions.className = "project-actions";
-  const status = createStatusSelect("project-status-select", PROJECT_STATUS_LABELS, project.status, "Project status");
-  status.addEventListener("change", () => saveProjectFields(project.id, {
-    title: project.title,
-    description: project.description,
-    status: status.value,
-  }));
-  const edit = document.createElement("button");
-  edit.type = "button";
-  edit.className = "project-edit-button";
-  edit.textContent = "Edit";
-  edit.addEventListener("click", () => openProjectDialog(project));
-  actions.append(status, edit);
-  header.append(heading, actions);
-
-  const taskCount = project.task_count || 0;
-  const completed = project.completed_count || 0;
-  const progress = taskCount ? Math.round(completed / taskCount * 100) : 0;
-  const progressRow = document.createElement("div");
-  progressRow.className = "project-progress";
-  if (taskCount) {
-    const progressLabel = document.createElement("span");
-    progressLabel.textContent = completed + " of " + taskCount + " tasks complete";
-    const track = document.createElement("div");
-    track.className = "project-progress-track";
-    track.setAttribute("role", "progressbar");
-    track.setAttribute("aria-valuemin", "0");
-    track.setAttribute("aria-valuemax", "100");
-    track.setAttribute("aria-valuenow", String(progress));
-    track.setAttribute("aria-label", "Project task completion");
-    const value = document.createElement("div");
-    value.className = "project-progress-value";
-    value.style.width = progress + "%";
-    track.append(value);
-    const percentage = document.createElement("span");
-    percentage.textContent = progress + "%";
-    progressRow.append(progressLabel, track, percentage);
-  }
-
-  const tasks = document.createElement("ul");
-  tasks.className = "project-tasks";
-  for (const task of project.tasks || []) tasks.append(renderProjectTask(task, project));
-
-  const addTask = document.createElement("form");
-  addTask.className = "project-add-task";
-  const taskInput = document.createElement("input");
-  taskInput.type = "text";
-  taskInput.maxLength = 500;
-  taskInput.setAttribute("aria-label", "New task");
-  const addButton = document.createElement("button");
-  addButton.type = "submit";
-  addButton.textContent = "Add task";
-  addTask.append(taskInput, addButton);
-  addTask.addEventListener("submit", (event) => {
+  box.addEventListener("keydown", submitOnEnter);
+  box.addEventListener("paste", (event) => pasteOneLine(event, { links }));
+  form.addEventListener("submit", (event) => {
     event.preventDefault();
-    createProjectTask(project.id, taskInput.value);
-  });
-
-  card.append(header);
-  if (taskCount) card.append(progressRow);
-  card.append(tasks, addTask);
-  return card;
-}
-
-function renderProjects() {
-  if (!state.projects) return;
-  const projects = state.projects.filter((project) =>
-    state.projectFilter === "all" || project.status === state.projectFilter
-  );
-  updateProjectsHeading();
-  $("#projects-count").textContent = String(state.projects.length);
-  for (const button of $("#projects-filters").querySelectorAll(".project-filter")) {
-    button.classList.toggle("active", button.dataset.status === state.projectFilter);
-  }
-
-  projectsList.replaceChildren();
-  if (!projects.length) return;
-  for (const project of projects) projectsList.append(renderProjectCard(project));
-}
-
-async function switchToProjects({ syncUrl = true } = {}) {
-  if (!confirmDiscardEditor()) return;
-  clearReader();
-  state.view = "projects";
-  navSearch.classList.remove("active");
-  navSearch.removeAttribute("aria-current");
-  setHomePresentation(false);
-  state.folder = "";
-  state.query = "";
-  $("#search-input").value = "";
-  $("#clear-search").hidden = true;
-  searchBar.hidden = true;
-  roadmapView.hidden = true;
-  projectsView.hidden = false;
-  followingView.hidden = true;
-  workspaceGrid.hidden = true;
-  navRoadmap.classList.remove("active");
-  navProjects.classList.add("active");
-  navFollowing.classList.remove("active");
-  for (const row of folderTree.querySelectorAll(".tree-row.selected")) row.classList.remove("selected");
-  if (syncUrl) history.replaceState(null, "", "/?view=projects");
-  projectsList.replaceChildren(roadmapMessage("Loading projects…"));
-  updateProjectsHeading();
-  try {
-    await loadProjects();
-    renderProjects();
-  } catch (error) {
-    projectsList.replaceChildren(roadmapMessage(error.message));
-  }
-}
-
-async function saveProjectFields(projectId, fields) {
-  try {
-    const response = await fetch("/api/projects?id=" + encodeURIComponent(projectId), {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(fields),
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not update project.");
-    await loadProjects({ force: true });
-    renderProjects();
-    showToast("Project updated");
-  } catch (error) {
-    showToast(error.message);
-    await loadProjects({ force: true }).catch(() => {});
-    renderProjects();
-  }
-}
-
-async function updateProjectTask(taskId, fields) {
-  try {
-    const response = await fetch("/api/project-tasks?id=" + encodeURIComponent(taskId), {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(fields),
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not update task.");
-    await loadProjects({ force: true });
-    renderProjects();
-  } catch (error) {
-    showToast(error.message);
-    await loadProjects({ force: true }).catch(() => {});
-    renderProjects();
-  }
-}
-
-async function createProjectTask(projectId, title) {
-  const cleanTitle = title.trim();
-  if (!cleanTitle) return;
-  try {
-    const response = await fetch("/api/project-tasks", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: projectId, title: cleanTitle }),
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not add task.");
-    await loadProjects({ force: true });
-    renderProjects();
-    showToast("Task added");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function deleteProjectTask(task, project) {
-  if (!window.confirm("Delete this task from " + project.title + "?")) return;
-  try {
-    const response = await fetch("/api/project-tasks?id=" + encodeURIComponent(task.id), { method: "DELETE" });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not delete task.");
-    await loadProjects({ force: true });
-    renderProjects();
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-function openProjectDialog(project = null) {
-  $("#project-dialog-title").textContent = project ? "Edit project" : "New project";
-  $("#project-id").value = project?.id || "";
-  $("#project-title").value = project?.title || "";
-  $("#project-description").value = project?.description || "";
-  $("#project-status").value = project?.status || "planned";
-  $("#save-project").textContent = project ? "Save project" : "Create project";
-  $("#delete-project").hidden = !project;
-  $("#project-dialog").showModal();
-  $("#project-title").focus();
-  if (!project) $("#project-title").select();
-}
-
-async function handleProjectFormSubmit(event) {
-  event.preventDefault();
-  const projectId = $("#project-id").value;
-  const fields = {
-    title: $("#project-title").value.trim(),
-    description: $("#project-description").value,
-    status: $("#project-status").value,
-  };
-  try {
-    const response = await fetch(projectId
-      ? "/api/projects?id=" + encodeURIComponent(projectId)
-      : "/api/projects", {
-      method: projectId ? "PUT" : "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(fields),
-    });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not save project.");
-    $("#project-dialog").close();
-    if (!projectId) state.projectFilter = "all";
-    await loadProjects({ force: true });
-    renderProjects();
-    showToast(projectId ? "Project saved" : "Project created");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function deleteProjectFromDialog() {
-  const projectId = $("#project-id").value;
-  const title = $("#project-title").value || "this project";
-  if (!projectId || !window.confirm("Delete " + title + " and all its tasks?")) return;
-  try {
-    const response = await fetch("/api/projects?id=" + encodeURIComponent(projectId), { method: "DELETE" });
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload.error || "Could not delete project.");
-    $("#project-dialog").close();
-    state.projectFilter = "all";
-    await loadProjects({ force: true });
-    renderProjects();
-    showToast("Project deleted");
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-function normalizeRoadmapLink(value) {
-  if (!value) return null;
-  const raw = String(value).trim();
-  const match = raw.match(/^\[\[([^\]]+)\](?:\[([^\]]*)\])?\]$/);
-  const target = (match ? match[1] : raw).trim();
-  const customLabel = (match?.[2] || "").trim();
-
-  if (/^https?:\/\//i.test(target)) {
-    return { kind: "external", href: target, label: customLabel || "Open link" };
-  }
-  if (/^mailto:/i.test(target)) {
-    return { kind: "external", href: target, label: customLabel || "Send email" };
-  }
-
-  let candidate = target.replace(/^file:/i, "").replace(/^\.\//, "").replace(/^\/+/, "");
-  try { candidate = decodeURIComponent(candidate); } catch { /* keep as is */ }
-  if (!candidate) return null;
-
-  const doc = state.documents.find((entry) => entry.path === candidate);
-  if (doc) {
-    return { kind: "note", doc, href: `/?note=${encodeURIComponent(doc.path)}`, label: customLabel || "Open note in Zetesis" };
-  }
-  if (/\.(pdf|png|jpe?g|gif|svg|webp)$/i.test(candidate)) {
-    return { kind: "file", href: `/api/file?path=${encodeURIComponent(candidate)}`, label: customLabel || "Open file" };
-  }
-  return null;
-}
-
-function roadmapLinks(item) {
-  const details = item.details || {};
-  const links = [];
-  const seen = new Set();
-
-  for (const key of ["link", "url", "resource"]) {
-    const link = normalizeRoadmapLink(details[key]);
-    if (link && !seen.has(link.href)) {
-      if (link.label === "Open link") {
-        link.label = ROADMAP_LINK_ACTIONS[String(item.type || "").toLowerCase()] || link.label;
-      }
-      seen.add(link.href);
-      links.push(link);
-    }
-  }
-
-  const source = String(details.source || "").trim();
-  if (/^(https?:\/\/|mailto:|\[\[|file:)/i.test(source)) {
-    const link = normalizeRoadmapLink(source);
-    if (link && !seen.has(link.href)) {
-      if (link.label === "Open link") {
-        link.label = ROADMAP_LINK_ACTIONS[String(item.type || "").toLowerCase()] || link.label;
-      }
-      seen.add(link.href);
-      links.push(link);
-    }
-  }
-
-  return links;
-}
-
-function roadmapLinkElement(link) {
-  const anchor = document.createElement("a");
-  anchor.className = "resource-link";
-  anchor.textContent = `${link.label} ↗`;
-
-  if (link.kind === "note") {
-    anchor.href = link.href;
-    anchor.addEventListener("click", (event) => {
-      event.preventDefault();
-      revealDocument(link.doc);
-    });
-  } else {
-    anchor.href = link.href;
-    anchor.target = "_blank";
-    anchor.rel = "noopener noreferrer";
-  }
-  return anchor;
-}
-
-// ── Up Next: inline editing & drag-and-drop helpers ──────────────────────────
-
-let draggedItemInfo = null;
-
-function serializeRoadmapToOrg(topics) {
-  const lines = ["#+title: Up Next", "#+author: zetesis", ""];
-  for (const topic of topics) {
-    lines.push(`* ${topic.name}`);
-    let lastSubtopic = "";
-    for (const item of topic.items || []) {
-      if (item.subtopic && item.subtopic !== lastSubtopic) {
-        lines.push(`** ${item.subtopic}`);
-        lastSubtopic = item.subtopic;
-      } else if (!item.subtopic) {
-        // A level-two resource belongs directly to the topic and ends the
-        // previous subtopic section in the Org outline.
-        lastSubtopic = "";
-      }
-      const tag = item.type && item.type !== "idea" ? `:${item.type}:` : (item.type === "idea" ? ":idea:" : "");
-      const statusPart = item.status ? `${item.status} ` : "";
-      const level = item.subtopic ? "***" : "**";
-      lines.push(`${level} ${statusPart}${item.title}${tag ? " " + tag : ""}`);
-      if (item.details) {
-        for (const [k, v] of Object.entries(item.details)) {
-          if (v) {
-            const label = k[0].toUpperCase() + k.slice(1);
-            lines.push(`   - ${label}: ${v}`);
-          }
-        }
-      }
-      for (const note of item.notes || []) {
-        if (note) lines.push(`   - ${note}`);
-      }
-    }
-    lines.push("");
-  }
-  return lines.join("\n");
-}
-
-async function saveRoadmapTopics(topics) {
-  const content = serializeRoadmapToOrg(topics);
-  const response = await fetch("/api/roadmap", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ content }),
-  });
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || "Could not save.");
-  state.roadmap = payload;
-  updateRoadmapCounts();
-  return payload;
-}
-
-function openUpNextItemDialog(existingItem, topicName, itemIndex, topicIndex, defaultSubtopic = "", defaultType = "idea") {
-  const form = $("#upnext-item-form");
-  const dialog = $("#upnext-item-dialog");
-  const defaultTopic = topicName || state.roadmapTopic || "";
-  $("#upnext-dialog-title").textContent = existingItem ? "Edit item" : "Add item";
-  $("#upnext-item-submit").textContent = existingItem ? "Save changes" : "Add item";
-  $("#upnext-item-title").value = existingItem?.title || "";
-  $("#upnext-item-topic").value = existingItem ? (topicName || "") : defaultTopic;
-  $("#upnext-item-subtopic").value = existingItem?.subtopic || defaultSubtopic;
-  $("#upnext-item-type").value = existingItem?.type || defaultType;
-  $("#upnext-item-status").value = existingItem?.status || "TODO";
-  $("#upnext-item-author").value = existingItem?.details?.author || existingItem?.details?.host || "";
-  $("#upnext-item-focus").value = existingItem?.details?.focus || "";
-  populateUpNextDatalists($("#upnext-item-topic").value);
-  form.dataset.topicIndex = topicIndex ?? "";
-  form.dataset.itemIndex = itemIndex ?? "";
-  form.dataset.editMode = existingItem ? "1" : "0";
-  dialog.showModal();
-  $("#upnext-item-title").focus();
-}
-
-function populateUpNextDatalists(topicName) {
-  const topics = state.roadmap?.topics || [];
-  const topicList = $("#upnext-topics-list");
-  const subtopicList = $("#upnext-subtopics-list");
-  topicList.replaceChildren();
-  subtopicList.replaceChildren();
-
-  const topicNames = [...new Set(topics.map((topic) => String(topic.name || "").trim()).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b));
-  for (const name of topicNames) {
-    const option = document.createElement("option");
-    option.value = name;
-    topicList.append(option);
-  }
-
-  const selectedTopic = topics.find((topic) =>
-    String(topic.name || "").trim().toLocaleLowerCase() === String(topicName || "").trim().toLocaleLowerCase()
-  );
-  const subtopics = [...new Set((selectedTopic?.items || [])
-    .map((item) => String(item.subtopic || "").trim())
-    .filter(Boolean))].sort((a, b) => a.localeCompare(b));
-  for (const name of subtopics) {
-    const option = document.createElement("option");
-    option.value = name;
-    subtopicList.append(option);
-  }
-}
-
-function upNextFindOrCreateTopic(topics, topicName) {
-  const trimmed = (topicName || "General").trim();
-  let topicIdx = topics.findIndex((t) => t.name.toLowerCase() === trimmed.toLowerCase());
-  if (topicIdx === -1) {
-    topics.push({ name: trimmed, items: [] });
-    topicIdx = topics.length - 1;
-  }
-  return topicIdx;
-}
-
-async function handleUpNextItemSubmit(event) {
-  event.preventDefault();
-  const form = $("#upnext-item-form");
-  const title = $("#upnext-item-title").value.trim();
-  const topicName = $("#upnext-item-topic").value.trim() || "General";
-  const type = $("#upnext-item-type").value;
-  const status = $("#upnext-item-status").value;
-  const subtopic = $("#upnext-item-subtopic").value.trim();
-  const author = $("#upnext-item-author").value.trim();
-  const focus = $("#upnext-item-focus").value.trim();
-  if (!title) return;
-
-  const topics = JSON.parse(JSON.stringify(state.roadmap?.topics || []));
-  const editMode = form.dataset.editMode === "1";
-  const existingTopicIdx = parseInt(form.dataset.topicIndex ?? "-1", 10);
-  const existingItemIdx = parseInt(form.dataset.itemIndex ?? "-1", 10);
-
-  const existingItem = (existingTopicIdx >= 0 && existingItemIdx >= 0)
-    ? topics[existingTopicIdx]?.items?.[existingItemIdx]
-    : null;
-
-  const newItem = {
-    title,
-    type,
-    status,
-    subtopic,
-    details: { ...(existingItem?.details || {}), ...(author ? { author } : {}), ...(focus ? { focus } : {}) },
-    notes: existingItem?.notes || [],
-  };
-  if (!author && newItem.details.author) delete newItem.details.author;
-  if (!focus && newItem.details.focus) delete newItem.details.focus;
-
-  if (editMode && existingTopicIdx >= 0 && existingItemIdx >= 0) {
-    const oldTopic = topics[existingTopicIdx];
-    if (oldTopic) oldTopic.items.splice(existingItemIdx, 1);
-  }
-
-  const targetIdx = upNextFindOrCreateTopic(topics, topicName);
-  if (editMode && existingTopicIdx >= 0 && existingItemIdx >= 0 && existingTopicIdx === targetIdx) {
-    topics[targetIdx].items.splice(existingItemIdx, 0, newItem);
-  } else {
-    topics[targetIdx].items.push(newItem);
-  }
-
-  const submitBtn = $("#upnext-item-submit");
-  submitBtn.disabled = true;
-  try {
-    await saveRoadmapTopics(topics);
-    $("#upnext-item-dialog").close();
-    renderRoadmap();
-    showToast(editMode ? "Item updated" : "Item added");
-  } catch (err) {
-    showToast(err.message);
-  } finally {
-    submitBtn.disabled = false;
-  }
-}
-
-async function deleteUpNextItem(topicIdx, itemIdx) {
-  if (!window.confirm("Remove this item from Up Next?")) return;
-  const topics = JSON.parse(JSON.stringify(state.roadmap?.topics || []));
-  if (topics[topicIdx]) {
-    const topicName = topics[topicIdx].name;
-    topics[topicIdx].items.splice(itemIdx, 1);
-    if (topics[topicIdx].items.length === 0) {
-      if (state.roadmapTopic === topicName) {
-        state.roadmapTopic = "";
-      }
-      topics.splice(topicIdx, 1);
-    }
-  }
-  try {
-    await saveRoadmapTopics(topics);
-    renderRoadmap();
-    showToast("Item removed");
-  } catch (err) {
-    showToast(err.message);
-  }
-}
-
-// ── Drag & Drop reordering (Smooth & Optimistic) ──────────────────────────────
-
-let draggedElement = null;
-
-function updateListItemIndices() {
-  document.querySelectorAll(".topic-item-list, .enlarged-item-list").forEach((listEl) => {
-    const rows = listEl.querySelectorAll(".topic-item-row, .enlarged-item-row");
-    rows.forEach((row, idx) => {
-      row.dataset.itemIdx = String(idx);
-    });
-  });
-}
-
-async function moveRoadmapItem(fromTopicIdx, fromRealIdx, toTopicIdx, targetRealIdx, isAfter, targetSubtopic = undefined, targetSection = undefined) {
-  const topics = JSON.parse(JSON.stringify(state.roadmap?.topics || []));
-  const fromTopic = topics[fromTopicIdx];
-  const toTopic = topics[toTopicIdx];
-  if (!fromTopic || !toTopic) return;
-
-  const sourceItem = fromTopic.items[fromRealIdx];
-  if (!sourceItem) return;
-  const oldSubtopic = String(sourceItem.subtopic || "").trim();
-  const oldType = String(sourceItem.type || "idea").toLowerCase();
-  const nextSubtopic = targetSubtopic === undefined
-    ? (fromTopicIdx === toTopicIdx ? oldSubtopic : "")
-    : String(targetSubtopic || "").trim();
-  const nextType = targetSection === "books" ? "book"
-    : targetSection === "items" && oldType === "book" ? "idea" : oldType;
-
-  let insertIdx = targetRealIdx + (isAfter ? 1 : 0);
-
-  if (fromTopicIdx === toTopicIdx) {
-    if (fromRealIdx < insertIdx) {
-      insertIdx -= 1;
-    }
-    if (insertIdx === fromRealIdx && nextSubtopic === oldSubtopic && nextType === oldType) {
+    const typed = typedMarkup(box);
+    const value = titleMarkup(box);
+    if (!value) return;
+    if (value.length > maxLength) {
+      showToast(`That's longer than ${maxLength} characters.`);
       return;
     }
-  }
-
-  const [movedItem] = fromTopic.items.splice(fromRealIdx, 1);
-  if (!movedItem) return;
-  movedItem.subtopic = nextSubtopic;
-  movedItem.type = nextType;
-
-  insertIdx = Math.max(0, Math.min(insertIdx, toTopic.items.length));
-  toTopic.items.splice(insertIdx, 0, movedItem);
-
-  // Update in-memory state immediately for instant responsiveness
-  state.roadmap = { ...state.roadmap, topics };
-
-  try {
-    await saveRoadmapTopics(topics);
-    if (fromTopicIdx !== toTopicIdx || state.roadmapFilter !== "all" || state.roadmapTopic || nextSubtopic !== oldSubtopic || nextType !== oldType) {
-      renderRoadmap();
-    } else {
-      updateListItemIndices();
-      updateRoadmapCounts();
+    // Cleared first: adding redraws the list, and the new box starts from the draft.
+    setBoxText(box, "");
+    drafts.delete(draft);
+    if (onAdd(value) === false) {
+      setBoxText(box, typed);
+      drafts.set(draft, typed);
+      focusEnd(box);
     }
-  } catch (err) {
-    showToast(err.message);
-    renderRoadmap();
-  }
+  });
+  return form;
 }
 
-async function appendRoadmapItem(fromTopicIdx, fromRealIdx, toTopicIdx, targetSubtopic = undefined, targetSection = undefined) {
-  const topics = JSON.parse(JSON.stringify(state.roadmap?.topics || []));
-  const fromTopic = topics[fromTopicIdx];
-  const toTopic = topics[toTopicIdx];
-  if (!fromTopic || !toTopic) return;
-  const sourceItem = fromTopic.items[fromRealIdx];
-  if (!sourceItem) return;
-  const oldSubtopic = String(sourceItem.subtopic || "").trim();
-  const oldType = String(sourceItem.type || "idea").toLowerCase();
-  const nextSubtopic = targetSubtopic === undefined
-    ? (fromTopicIdx === toTopicIdx ? oldSubtopic : "")
-    : String(targetSubtopic || "").trim();
-  const nextType = targetSection === "books" ? "book"
-    : targetSection === "items" && oldType === "book" ? "idea" : oldType;
-  if (fromTopicIdx === toTopicIdx && fromRealIdx === fromTopic.items.length - 1 && nextSubtopic === oldSubtopic && nextType === oldType) return;
-
-  const [movedItem] = fromTopic.items.splice(fromRealIdx, 1);
-  if (!movedItem) return;
-  movedItem.subtopic = nextSubtopic;
-  movedItem.type = nextType;
-
-  toTopic.items.push(movedItem);
-  state.roadmap = { ...state.roadmap, topics };
-
-  try {
-    await saveRoadmapTopics(topics);
-    if (fromTopicIdx !== toTopicIdx || state.roadmapFilter !== "all" || state.roadmapTopic || nextSubtopic !== oldSubtopic || nextType !== oldType) {
-      renderRoadmap();
-    } else {
-      updateListItemIndices();
-      updateRoadmapCounts();
-    }
-  } catch (err) {
-    showToast(err.message);
-    renderRoadmap();
-  }
-}
-
-function attachItemDragEvents(row, topicIdx, realItemIdx, item) {
+// Rows in one list can be dragged up or down; `onMove(from, to, after)` gets
+// their data-index values.
+function makeReorderable(row, list, onMove) {
   row.draggable = true;
-
-  row.addEventListener("dragstart", (e) => {
-    if (e.target.closest(".topic-item-action, button, a, input, select")) {
-      e.preventDefault();
-      return;
-    }
-    draggedElement = row;
-    draggedItemInfo = { topicIdx, realItemIdx: parseInt(row.dataset.itemIdx ?? realItemIdx, 10), item };
+  row.addEventListener("dragstart", (event) => {
+    rowDrag = { row, list };
     row.classList.add("dragging");
-    e.dataTransfer.effectAllowed = "move";
-    e.dataTransfer.setData("text/plain", `${row.dataset.topicIdx}:${row.dataset.itemIdx}`);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", row.querySelector(".title")?.textContent || "");
   });
-
   row.addEventListener("dragend", () => {
     row.classList.remove("dragging");
-    document.querySelectorAll(".drag-over-top, .drag-over-bottom, .drag-over").forEach((el) => {
-      el.classList.remove("drag-over-top", "drag-over-bottom", "drag-over");
-    });
-    draggedItemInfo = null;
-    draggedElement = null;
+    for (const marked of list.querySelectorAll(".drop-before, .drop-after")) marked.classList.remove("drop-before", "drop-after");
+    rowDrag = null;
   });
-
-  row.addEventListener("dragover", (e) => {
-    if (!draggedItemInfo) return;
-    e.preventDefault();
-    e.stopPropagation();
-    e.dataTransfer.dropEffect = "move";
-
+  row.addEventListener("dragover", (event) => {
+    if (!rowDrag || rowDrag.list !== list || rowDrag.row === row) return;
+    event.preventDefault();
     const rect = row.getBoundingClientRect();
-    const relY = e.clientY - rect.top;
-    const isBottom = relY > rect.height / 2;
-
-    row.classList.toggle("drag-over-top", !isBottom);
-    row.classList.toggle("drag-over-bottom", isBottom);
+    const after = event.clientY > rect.top + rect.height / 2;
+    row.classList.toggle("drop-before", !after);
+    row.classList.toggle("drop-after", after);
   });
-
-  row.addEventListener("dragleave", (e) => {
-    if (!row.contains(e.relatedTarget)) {
-      row.classList.remove("drag-over-top", "drag-over-bottom");
-    }
-  });
-
-  row.addEventListener("drop", async (e) => {
-    if (!draggedItemInfo || !draggedElement) return;
-    e.preventDefault();
-    e.stopPropagation();
-    row.classList.remove("drag-over-top", "drag-over-bottom");
-
-    const fromTopicIdx = parseInt(draggedElement.dataset.topicIdx, 10);
-    const fromRealIdx = parseInt(draggedElement.dataset.itemIdx, 10);
-    const toTopicIdx = parseInt(row.dataset.topicIdx, 10);
-    const targetRealIdx = parseInt(row.dataset.itemIdx, 10);
-    const targetList = row.closest(".enlarged-item-list");
-    const targetGroup = row.closest(".subtopic-group");
-    const targetResourceSection = row.closest(".topic-resource-section");
-    const targetSubtopic = targetGroup
-      ? targetGroup.dataset.subtopic
-      : targetList?.hasAttribute("data-subtopic") ? targetList.dataset.subtopic : undefined;
-    const targetSection = targetResourceSection?.dataset.itemSection;
-
-    const rect = row.getBoundingClientRect();
-    const isBottom = (e.clientY - rect.top) > rect.height / 2;
-
-    // Smooth optimistic DOM move right on drop (no aggressive snap)
-    const targetParent = row.parentElement;
-    if (targetParent && draggedElement && draggedElement !== row) {
-      const nextSibling = isBottom ? row.nextSibling : row;
-      if (draggedElement.nextSibling !== nextSibling) {
-        targetParent.insertBefore(draggedElement, nextSibling);
-        draggedElement.classList.add("just-dropped");
-        setTimeout(() => draggedElement?.classList.remove("just-dropped"), 400);
-      }
-    }
-
-    await moveRoadmapItem(fromTopicIdx, fromRealIdx, toTopicIdx, targetRealIdx, isBottom, targetSubtopic, targetSection);
+  row.addEventListener("dragleave", () => row.classList.remove("drop-before", "drop-after"));
+  row.addEventListener("drop", (event) => {
+    if (!rowDrag || rowDrag.list !== list) return;
+    event.preventDefault();
+    const after = row.classList.contains("drop-after");
+    row.classList.remove("drop-before", "drop-after");
+    onMove(Number(rowDrag.row.dataset.index), Number(row.dataset.index), after);
   });
 }
 
-function attachContainerDropEvents(listEl, topicIdx) {
-  listEl.addEventListener("dragover", (e) => {
-    if (!draggedItemInfo) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "move";
-    listEl.classList.add("drag-over");
-  });
-
-  listEl.addEventListener("dragleave", (e) => {
-    if (!listEl.contains(e.relatedTarget)) {
-      listEl.classList.remove("drag-over");
-    }
-  });
-
-  listEl.addEventListener("drop", async (e) => {
-    listEl.classList.remove("drag-over");
-    if (!draggedItemInfo || !draggedElement) return;
-    if (e.target.closest(".topic-item-row, .enlarged-item-row")) return;
-    e.preventDefault();
-
-    const fromTopicIdx = parseInt(draggedElement.dataset.topicIdx, 10);
-    const fromRealIdx = parseInt(draggedElement.dataset.itemIdx, 10);
-    const toTopicIdx = topicIdx;
-
-    if (draggedElement && (draggedElement.parentElement !== listEl || draggedElement !== listEl.lastElementChild)) {
-      listEl.appendChild(draggedElement);
-      draggedElement.classList.add("just-dropped");
-      setTimeout(() => draggedElement?.classList.remove("just-dropped"), 400);
-    }
-
-    const targetSubtopic = listEl.hasAttribute("data-subtopic") ? listEl.dataset.subtopic : undefined;
-    const targetSection = listEl.closest(".topic-resource-section")?.dataset.itemSection;
-    await appendRoadmapItem(fromTopicIdx, fromRealIdx, toTopicIdx, targetSubtopic, targetSection);
-  });
+function moveInList(list, from, to, after) {
+  const [moved] = list.splice(from, 1);
+  const target = to > from ? to - 1 : to;
+  list.splice(after ? target + 1 : target, 0, moved);
 }
 
-// ── Render helpers ────────────────────────────────────────────────────────────
-
-function renderEnlargedItemRow(item, realItemIdx, topicIdx, topic) {
-  const li = document.createElement("li");
-  li.className = "enlarged-item-row";
-  li.dataset.itemIdx = String(realItemIdx);
-  li.dataset.topicIdx = String(topicIdx);
-
-  const contentCol = document.createElement("div");
-  contentCol.className = "enlarged-item-content";
-
-  const primaryRow = document.createElement("div");
-  primaryRow.className = "enlarged-item-primary-row";
-
-  const title = document.createElement("h3");
-  title.className = "enlarged-item-title";
-  title.innerHTML = renderInline(item.title || "Untitled", "roadmap.org");
-  primaryRow.append(title);
-
-  const details = item.details || {};
-  let creator = details.author || details.host || details.creator || "";
-  if (!creator) {
-    const source = String(details.source || "").trim();
-    if (source && !/^(https?:\/\/|mailto:|\[\[|file:)/i.test(source)) creator = source;
+// Redraw a list, keeping the focus in the add box it was in (an area's
+// sections each have their own).
+function redrawList(container, content) {
+  const box = container.contains(document.activeElement) && document.activeElement.closest(".add-line .add-box");
+  const line = box && box.closest(".add-line");
+  container.replaceChildren(content);
+  if (box) {
+    const place = line.dataset.place;
+    const next = (place && container.querySelector(`.add-line[data-place="${place}"] .add-box`)) || container.querySelector(".add-line .add-box");
+    // Adding to a list keeps its box in view; a list just opened starts at its top.
+    focusEnd(next, { scroll: next?.closest(".add-line").dataset.draft === line.dataset.draft });
   }
-  if (creator) {
-    const creatorSpan = document.createElement("span");
-    creatorSpan.className = "enlarged-item-author";
-    creatorSpan.textContent = creator;
-    primaryRow.append(creatorSpan);
-  }
-
-  contentCol.append(primaryRow);
-
-  const focus = details.focus || details.why || details.topic || details.description || "";
-  if (focus) {
-    const focusP = document.createElement("p");
-    focusP.className = "enlarged-item-focus";
-    focusP.textContent = focus;
-    contentCol.append(focusP);
-  }
-
-  const notes = item.notes || [];
-  if (notes.length) {
-    const notesList = document.createElement("ul");
-    notesList.className = "enlarged-item-notes";
-    for (const note of notes) {
-      const noteLi = document.createElement("li");
-      noteLi.textContent = note;
-      notesList.append(noteLi);
-    }
-    contentCol.append(notesList);
-  }
-
-  const links = roadmapLinks(item);
-  if (links.length) {
-    const linkRow = document.createElement("div");
-    linkRow.className = "resource-links";
-    for (const link of links) linkRow.append(roadmapLinkElement(link));
-    contentCol.append(linkRow);
-  }
-
-  const actions = document.createElement("div");
-  actions.className = "enlarged-item-actions";
-
-  const editBtn = document.createElement("button");
-  editBtn.type = "button";
-  editBtn.className = "topic-item-action";
-  editBtn.title = "Edit item";
-  editBtn.textContent = "✎";
-  editBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    openUpNextItemDialog(item, topic.name, parseInt(li.dataset.itemIdx, 10), topicIdx);
-  });
-
-  const delBtn = document.createElement("button");
-  delBtn.type = "button";
-  delBtn.className = "topic-item-action topic-item-delete";
-  delBtn.title = "Remove item";
-  delBtn.textContent = "×";
-  delBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    deleteUpNextItem(topicIdx, parseInt(li.dataset.itemIdx, 10));
-  });
-
-  actions.append(editBtn, delBtn);
-
-  li.append(contentCol, actions);
-  attachItemDragEvents(li, topicIdx, realItemIdx, item);
-  return li;
+  showNav();
 }
 
-function renderEnlargedItemList(items, topicIdx, topic, subtopic, itemSection = "") {
-  const list = document.createElement("ul");
-  list.className = "enlarged-item-list";
-  list.dataset.subtopic = subtopic;
-  list.dataset.itemSection = itemSection;
-  for (const item of items) {
-    const realItemIdx = (topic.items || []).indexOf(item);
-    list.append(renderEnlargedItemRow(item, realItemIdx, topicIdx, topic));
+// The cursor at the end of an add box. With `scroll`, its whole line comes
+// into view (the browser would show only the caret); without, the page stays put.
+function focusEnd(box, { scroll = true } = {}) {
+  if (!box) return;
+  box.focus({ preventScroll: true });
+  getSelection().selectAllChildren(box);
+  getSelection().collapseToEnd();
+  if (scroll) box.closest(".add-line").scrollIntoView({ block: "nearest" });
+}
+
+// Keys in add boxes: Escape clears the box, or, when it's empty, goes up a
+// level; ↑ or ⌃N/⌃P from an empty box moves into the list.
+function addBoxKeys(event) {
+  const box = event.target.closest(".add-line .add-box");
+  if (!box) return;
+  const step = stepKey(event);
+  if (event.key === "Escape" && !event.isComposing) {
+    event.stopPropagation();
+    if (box.textContent) {
+      setBoxText(box, "");
+      box.dispatchEvent(new Event("input"));
+    } else {
+      box.blur();
+      goUp();
+    }
+  } else if ((event.key === "ArrowUp" || step) && !box.textContent) {
+    event.preventDefault();
+    moveNav(step || -1);
   }
-  attachContainerDropEvents(list, topicIdx);
+}
+
+roadmapTopics.addEventListener("keydown", addBoxKeys);
+roadmapTopics.addEventListener("focusin", (event) => {
+  if (event.target.closest(".add-line .add-box")) clearNav();
+});
+
+// ── Explore: areas, each a plain list of items ──────────────────────────────
+
+let exploreWrites = Promise.resolve();
+
+function exploreAreas() {
+  return state.roadmap?.areas || [];
+}
+
+function currentAreaIndex() {
+  return exploreAreas().findIndex((area) => area.name === state.roadmapTopic);
+}
+
+// An area, or a section in one (which can hold sections of its own), is a
+// list, found by its place: [area index, section index, section index, …].
+const EXPLORE_MAX_DEPTH = 5;
+
+function exploreNode(areas, place) {
+  let list = areas[place[0]];
+  for (const index of place.slice(1)) list = list?.sections[index];
   return list;
 }
 
-function renderEnlargedSubtopicGroup(subtopic, items, topic, topicIdx, itemSection) {
-  const group = document.createElement("div");
-  group.className = "subtopic-group";
-  group.dataset.subtopic = subtopic;
+const placeOf = (element) => element.dataset.place.split(".").map(Number);
+const samePlace = (a, b) => a.join(".") === b.join(".");
+// Whether `place` is `outer` or inside it.
+const within = (place, outer) => outer.every((index, depth) => place[depth] === index);
 
-  if (subtopic) {
-    const title = document.createElement("h4");
-    title.className = "subtopic-group-title";
-    title.textContent = subtopic;
-    group.append(title);
-  }
-  group.append(renderEnlargedItemList(items, topicIdx, topic, subtopic, itemSection));
-  return group;
+// The names on the way to a list: ["Machine Learning", "Transformers"].
+function exploreTrail(place) {
+  return place.map((_, depth) => exploreNode(exploreAreas(), place.slice(0, depth + 1)).name);
 }
 
-function renderTopicResourceSection(sectionName, items, topic, topicIdx, defaultType) {
-  const section = document.createElement("section");
-  section.className = "topic-resource-section";
-  section.dataset.itemSection = sectionName.toLowerCase();
+// A list and every section in it, depth first, with their places.
+function exploreLists(list, place) {
+  return [{ list, place }, ...list.sections.flatMap((section, index) => exploreLists(section, [...place, index]))];
+}
 
-  const header = document.createElement("header");
-  header.className = "topic-resource-section-header";
-  const title = document.createElement("h3");
-  title.textContent = sectionName;
-  const addButton = document.createElement("button");
-  addButton.type = "button";
-  addButton.className = "topic-resource-add";
-  addButton.textContent = "+";
-  addButton.setAttribute("aria-label", `Add ${sectionName.toLowerCase() === "books" ? "book" : "item"}`);
-  addButton.addEventListener("click", () => openUpNextItemDialog(null, topic.name, -1, topicIdx, "", defaultType));
-  header.append(title, addButton);
+function openCount(list) {
+  return list.items.filter((item) => !item.done).length + list.sections.reduce((count, section) => count + openCount(section), 0);
+}
 
-  const body = document.createElement("div");
-  body.className = "topic-resource-section-body";
-  const hasSubtopics = items.some((item) => String(item.subtopic || "").trim());
-  if (!hasSubtopics) {
-    body.append(renderEnlargedItemList(items, topicIdx, topic, "", sectionName.toLowerCase()));
-  } else {
-    const groups = new Map();
-    for (const item of items) {
-      const subtopic = String(item.subtopic || "").trim();
-      if (!groups.has(subtopic)) groups.set(subtopic, []);
-      groups.get(subtopic).push(item);
-    }
-    for (const [subtopic, groupItems] of groups) {
-      body.append(renderEnlargedSubtopicGroup(subtopic, groupItems, topic, topicIdx, sectionName.toLowerCase()));
-    }
+// Levels of sections in a section, its own included.
+function sectionHeight(section) {
+  return 1 + Math.max(0, ...section.sections.map(sectionHeight));
+}
+
+// Apply a change locally and save the whole list. Saves run one at a time,
+// each with the areas as they were when it was made. `undo` names the change
+// in a toast that offers to put things back.
+function changeExplore(change, { undo = "" } = {}) {
+  const previous = structuredClone(exploreAreas());
+  const areas = structuredClone(previous);
+  if (change(areas) === false) return;
+  state.roadmap = { areas };
+  renderRoadmap();
+  exploreWrites = exploreWrites
+    .then(async () => {
+      const response = await fetch("/api/roadmap", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ areas }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || "Could not save Explore.");
+    })
+    .catch(async (error) => {
+      showToast(error.message);
+      state.roadmap = null;
+      await loadRoadmap().catch(() => {});
+      if (state.view === "roadmap") renderRoadmap();
+    });
+  if (undo) {
+    showToast(undo, { action: "Undo", onAction: () => changeExplore((current) => current.splice(0, current.length, ...previous)) });
   }
+}
 
-  section.append(header, body);
+function areaNameTaken(name, exceptIndex = -1) {
+  return exploreAreas().some((area, index) => index !== exceptIndex && area.name.toLowerCase() === name.toLowerCase());
+}
+
+function renameArea(index, name) {
+  const area = exploreAreas()[index];
+  if (!area || !name || name === area.name) return;
+  if (areaNameTaken(name, index)) {
+    showToast(`There's already an area called “${name}”.`);
+    return;
+  }
+  if (state.roadmapTopic === area.name) {
+    state.roadmapTopic = name;
+    history.replaceState(null, "", `/?${new URLSearchParams({ view: "roadmap", topic: name })}`);
+  }
+  changeExplore((areas) => {
+    areas[index].name = name;
+  });
+}
+
+function deleteArea(index) {
+  const area = exploreAreas()[index];
+  if (!area) return;
+  if (state.roadmapTopic === area.name) {
+    state.roadmapTopic = "";
+    history.replaceState(null, "", "/?view=roadmap");
+  }
+  changeExplore((areas) => {
+    areas.splice(index, 1);
+  }, { undo: `Deleted “${area.name}”` });
+}
+
+function moveArea(index, step) {
+  if (!exploreAreas()[index + step]) return false;
+  changeExplore((areas) => moveInList(areas, index, index + step, step > 0));
+}
+
+function deleteExploreItem(place, itemIndex) {
+  changeExplore((areas) => {
+    exploreNode(areas, place).items.splice(itemIndex, 1);
+  }, { undo: "Item deleted" });
+}
+
+function toggleExploreItem(place, itemIndex) {
+  changeExplore((areas) => {
+    const item = exploreNode(areas, place).items[itemIndex];
+    item.done = !item.done;
+  });
+}
+
+// Up or down past the next unfinished item in its list.
+function moveExploreItem(place, itemIndex, step) {
+  const items = exploreNode(exploreAreas(), place).items;
+  const open = items.flatMap((item, index) => (item.done ? [] : [index]));
+  const target = open[open.indexOf(itemIndex) + step];
+  if (target === undefined) return false;
+  changeExplore((areas) => moveInList(exploreNode(areas, place).items, itemIndex, target, step > 0));
+  return `item:${place.join(".")}:${target}`;
+}
+
+function moveItemTo(place, itemIndex, to) {
+  changeExplore((areas) => {
+    const [moved] = exploreNode(areas, place).items.splice(itemIndex, 1);
+    exploreNode(areas, to).items.push(moved);
+  });
+}
+
+// An item, or with "# Name", a section.
+function addToExplore(place, text) {
+  const heading = text.match(/^#\s+(.+)$/);
+  if (heading) return createSection(place, heading[1].trim());
+  changeExplore((areas) => {
+    exploreNode(areas, place).items.push({ title: text, done: false });
+  });
+}
+
+// ── Sections ────────────────────────────────────────────────────────────────
+
+// Why `name` can't name a section in `parent` (beside `except`), or "".
+// Explore is kept as an Org outline, where a heading named like an item would read back as one.
+function sectionNameProblem(parent, name, except = null) {
+  const status = name.match(/^(NEXT|TODO|IDEA|DONE|READING|IN_PROGRESS)\s/);
+  if (status) return `A section's name can't start with “${status[1]}”.`;
+  if (/\s:[A-Za-z0-9_:]+:$/.test(name)) return "A section's name can't end in a :tag:.";
+  const taken = parent.sections.some((section) => section !== except && section.name.toLowerCase() === name.toLowerCase());
+  return taken ? `There's already a section called “${name}” there.` : "";
+}
+
+// Open or closed, remembered by the names on the way to the section.
+function sectionOpen(place) {
+  try {
+    return localStorage.getItem(`zetesis.explore.closed.${exploreTrail(place).join("/")}`) !== "1";
+  } catch {
+    return true;
+  }
+}
+
+function setSectionOpen(place, open, trail = exploreTrail(place)) {
+  try {
+    const key = `zetesis.explore.closed.${trail.join("/")}`;
+    if (open) localStorage.removeItem(key);
+    else localStorage.setItem(key, "1");
+  } catch { /* Remembering it is optional. */ }
+}
+
+function toggleSection(place) {
+  setSectionOpen(place, !sectionOpen(place));
+  renderRoadmap();
+}
+
+// A new section at the end of the list at `place`, holding the item `moving`
+// ({ place, index }) if given.
+function createSection(place, name, moving = null) {
+  const problem = place.length > EXPLORE_MAX_DEPTH
+    ? `Sections go ${EXPLORE_MAX_DEPTH} deep at most.`
+    : sectionNameProblem(exploreNode(exploreAreas(), place), name);
+  if (problem) {
+    showToast(problem);
+    return false;
+  }
+  setSectionOpen(null, true, [...exploreTrail(place), name]);
+  changeExplore((areas) => {
+    const section = { name, items: [], sections: [] };
+    if (moving) section.items.push(...exploreNode(areas, moving.place).items.splice(moving.index, 1));
+    exploreNode(areas, place).sections.push(section);
+  });
+}
+
+function renameSection(place, name) {
+  const section = exploreNode(exploreAreas(), place);
+  const problem = name === section.name ? "" : sectionNameProblem(exploreNode(exploreAreas(), place.slice(0, -1)), name, section);
+  if (problem) showToast(problem);
+  if (problem || name === section.name) {
+    renderRoadmap();
+    return;
+  }
+  setSectionOpen(null, sectionOpen(place), [...exploreTrail(place.slice(0, -1)), name]);
+  changeExplore((areas) => {
+    exploreNode(areas, place).name = name;
+  });
+}
+
+function deleteSection(place) {
+  const { name } = exploreNode(exploreAreas(), place);
+  changeExplore((areas) => {
+    exploreNode(areas, place.slice(0, -1)).sections.splice(place.at(-1), 1);
+  }, { undo: `Deleted “${name}”` });
+}
+
+// Up or down past the section beside it.
+function moveSection(place, step) {
+  const index = place.at(-1);
+  if (!exploreNode(exploreAreas(), place.slice(0, -1)).sections[index + step]) return false;
+  changeExplore((areas) => moveInList(exploreNode(areas, place.slice(0, -1)).sections, index, index + step, step > 0));
+  return `section:${[...place.slice(0, -1), index + step].join(".")}`;
+}
+
+// Into the list at `to`: at the end of its sections, or beside its section `beside`.
+function moveSectionTo(place, to, { beside = null, after = false } = {}) {
+  const section = exploreNode(exploreAreas(), place);
+  let problem = samePlace(to, place.slice(0, -1)) ? "" : sectionNameProblem(exploreNode(exploreAreas(), to), section.name);
+  if (to.length + sectionHeight(section) > EXPLORE_MAX_DEPTH + 1) problem = `Sections go ${EXPLORE_MAX_DEPTH} deep at most.`;
+  if (problem) {
+    showToast(problem);
+    return;
+  }
+  changeExplore((areas) => {
+    const into = exploreNode(areas, to);
+    const anchor = beside && exploreNode(areas, beside);
+    const [moved] = exploreNode(areas, place.slice(0, -1)).sections.splice(place.at(-1), 1);
+    if (anchor) into.sections.splice(into.sections.indexOf(anchor) + (after ? 1 : 0), 0, moved);
+    else into.sections.push(moved);
+  });
+}
+
+// Name a new section where it will go: after the sections in the list at `place`.
+function startNewSection(place, { moving = null } = {}) {
+  if (place.length > EXPLORE_MAX_DEPTH) {
+    showToast(`Sections go ${EXPLORE_MAX_DEPTH} deep at most.`);
+    return;
+  }
+  if (place.length > 1 && !sectionOpen(place)) {
+    setSectionOpen(place, true);
+    renderRoadmap();
+  }
+  const box = roadmapTopics.querySelector(`.add-line[data-place="${place.join(".")}"]`);
+  if (!box) return;
+  const sections = box.parentElement.querySelectorAll(":scope > .explore-section");
+  const draft = document.createElement("div");
+  draft.className = "explore-section";
+  draft.innerHTML = `<ul class="rows"><li class="row section-row editing"><span class="caret">${chevronSvg}</span><span class="title"></span></li></ul>`;
+  (sections[sections.length - 1] || box).after(draft);
+  editInline(draft.querySelector(".title"), "", (name) => {
+    if (!name || createSection(place, name, moving) === false) renderRoadmap();
+  });
+}
+
+function startSectionRename(place) {
+  const row = roadmapTopics.querySelector(`.section-row[data-place="${place.join(".")}"]`);
+  if (!row) return;
+  row.draggable = false;
+  row.classList.add("editing");
+  editInline(row.querySelector(".title"), exploreNode(exploreAreas(), place).name, (name) => {
+    if (name) renameSection(place, name);
+    else renderRoadmap();
+  });
+}
+
+function areaMenu(index) {
+  const area = exploreAreas()[index];
+  return [
+    { label: "Open", onPick: () => openRoadmapTopic(area.name) },
+    { label: "Rename", onPick: () => startAreaRename(index) },
+    "-",
+    { label: "Delete", danger: true, onPick: () => deleteArea(index) },
+  ];
+}
+
+function startAreaRename(index) {
+  const name = exploreAreas()[index]?.name;
+  const target = state.roadmapTopic
+    ? $("#page-title")
+    : roadmapTopics.querySelector(`.area-row[data-index="${index}"] .title`);
+  if (!target) return;
+  const row = target.closest(".row");
+  if (row) {
+    row.draggable = false;
+    row.classList.add("editing");
+  }
+  editInline(target, name, (value) => (value ? renameArea(index, value) : renderRoadmap()));
+}
+
+// Where an item or section can go: its area and the sections in it, then the other areas.
+function exploreMoveTargets(place) {
+  const areas = exploreAreas();
+  return [
+    ...exploreLists(areas[place[0]], [place[0]]),
+    ...areas.flatMap((area, index) => (index === place[0] ? [] : [{ list: area, place: [index] }])),
+  ];
+}
+
+function moveTargetEntry({ list, place }, onPick) {
+  const parent = place.length > 1 ? exploreNode(exploreAreas(), place.slice(0, -1)).name : "";
+  return { label: list.name, detail: parent ? `in ${parent}` : "area", onPick };
+}
+
+function itemMenu(place, itemIndex, row) {
+  const item = exploreNode(exploreAreas(), place).items[itemIndex];
+  const targets = exploreMoveTargets(place).filter((target) => !samePlace(target.place, place));
+  return [
+    { label: "Edit", onPick: () => beginItemEdit(row) },
+    { label: item.done ? "Mark not done" : "Mark done", onPick: () => toggleExploreItem(place, itemIndex) },
+    "-",
+    { heading: "Move to" },
+    ...targets.map((target) => moveTargetEntry(target, () => moveItemTo(place, itemIndex, target.place))),
+    {
+      label: "New section…",
+      disabled: place.length > EXPLORE_MAX_DEPTH,
+      onPick: () => startNewSection(place, { moving: { place, index: itemIndex } }),
+    },
+    "-",
+    { label: "Delete", danger: true, onPick: () => deleteExploreItem(place, itemIndex) },
+  ];
+}
+
+function sectionMenu(place) {
+  const targets = exploreMoveTargets(place)
+    .filter((target) => !within(target.place, place) && !samePlace(target.place, place.slice(0, -1)));
+  return [
+    { label: sectionOpen(place) ? "Collapse" : "Expand", onPick: () => toggleSection(place) },
+    { label: "Rename", onPick: () => startSectionRename(place) },
+    { label: "New section inside", disabled: place.length > EXPLORE_MAX_DEPTH, onPick: () => startNewSection(place) },
+    ...(targets.length ? ["-", { heading: "Move to" }] : []),
+    ...targets.map((target) => moveTargetEntry(target, () => moveSectionTo(place, target.place))),
+    "-",
+    { label: "Delete", danger: true, onPick: () => deleteSection(place) },
+  ];
+}
+
+// ── Editing an item in place (as in Ergon) ──────────────────────────────────
+
+const itemOf = (row) => exploreNode(exploreAreas(), placeOf(row))?.items[Number(row.dataset.index)];
+
+function beginItemEdit(row, point) {
+  const title = row.querySelector(".title");
+  row.classList.add("editing");
+  row.draggable = false;
+  setNav(navRows().indexOf(row), rowKey(row));
+  // Rich editing keeps links as links; beforeinput below limits it to text and links.
+  title.contentEditable = "true";
+  editHistory.host = null;
+  title.focus();
+  const range = point && document.caretRangeFromPoint?.(point.x, point.y);
+  const selection = getSelection();
+  if (range && title.contains(range.startContainer)) {
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } else {
+    selection.selectAllChildren(title);
+    selection.collapseToEnd();
+  }
+}
+
+function endItemEdit(row, save) {
+  if (!row.classList.contains("editing")) return;
+  const title = row.querySelector(".title");
+  const item = itemOf(row);
+  row.classList.remove("editing");
+  row.draggable = !row.classList.contains("is-done");
+  title.removeAttribute("contenteditable");
+  getSelection().removeAllRanges();
+  if (!item) return;
+  const text = titleMarkup(title);
+  const place = placeOf(row);
+  const itemIndex = Number(row.dataset.index);
+  if (!save || text === item.title) showLinks(title, item.title);
+  else if (text) changeExplore((areas) => { exploreNode(areas, place).items[itemIndex].title = text; });
+  else deleteExploreItem(place, itemIndex);
+}
+
+roadmapTopics.addEventListener("keydown", (event) => {
+  const row = event.target.closest(".row.editing[data-kind='item']");
+  const step = stepKey(event);
+  if (!row || event.isComposing || !(event.key === "Enter" || event.key === "Escape" || step)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const unchanged = titleMarkup(row.querySelector(".title")) === itemOf(row)?.title;
+  const place = placeOf(row);
+  const itemIndex = Number(row.dataset.index);
+  endItemEdit(row, event.key !== "Escape");
+  if (step) moveNav(step);
+  // Enter saves an edit; with nothing to save, it checks the item off.
+  else if (event.key === "Enter" && unchanged) toggleExploreItem(place, itemIndex);
+});
+
+roadmapTopics.addEventListener("focusout", (event) => {
+  const row = event.target.closest(".row.editing[data-kind='item']");
+  // Switching to another app keeps the edit open, so typing carries on when you come back.
+  if (row && document.hasFocus()) endItemEdit(row, true);
+});
+
+// Clicking around the text of the item being edited keeps the caret in it.
+roadmapTopics.addEventListener("mousedown", (event) => {
+  if (event.target.closest(".row.editing[data-kind='item']") && !event.target.closest(".title, button")) event.preventDefault();
+});
+
+roadmapTopics.addEventListener("paste", (event) => {
+  if (event.target.closest(".row.editing[data-kind='item']")) pasteOneLine(event);
+});
+
+// The browser types at the end of a link outside it. That suits a caret placed after a link,
+// but not retyping a link's words, so text typed over part of a link is put inside it by hand.
+let typingIntoLink = null;
+
+function linkAround(node) {
+  return (node?.nodeType === Node.TEXT_NODE ? node.parentElement : node)?.closest?.(".title a, .add-box a") ?? null;
+}
+
+roadmapTopics.addEventListener("beforeinput", (event) => {
+  if (!event.target.closest?.(".row.editing[data-kind='item'], .add-line .add-box")) return;
+  if (/^(format|insertFromDrop|insertParagraph|insertLineBreak)/.test(event.inputType)) {
+    event.preventDefault();
+    return;
+  }
+  const selection = getSelection();
+  const range = selection.rangeCount ? selection.getRangeAt(0) : null;
+  const link = range && linkAround(range.startContainer);
+  const insideLink = link && link === linkAround(range.endContainer);
+  const atLinkEnd = range?.collapsed && link && link === typingIntoLink
+    && range.startContainer === link.lastChild && range.startOffset === link.lastChild.length;
+  if (event.inputType !== "insertText" || !insideLink || (range.collapsed && !atLinkEnd)) {
+    typingIntoLink = null;
+    return;
+  }
+  event.preventDefault();
+  range.deleteContents();
+  const node = link.lastChild?.nodeType === Node.TEXT_NODE && range.startContainer === link.lastChild
+    ? link.lastChild : range.startContainer;
+  if (node.nodeType === Node.TEXT_NODE) {
+    node.insertData(range.startOffset, event.data);
+    selection.collapse(node, range.startOffset + event.data.length);
+  } else {
+    const typed = document.createTextNode(event.data);
+    range.insertNode(typed);
+    selection.collapse(typed, typed.length);
+  }
+  typingIntoLink = link;
+});
+
+roadmapTopics.addEventListener("keydown", (event) => {
+  // Moving the caret, or anything but plain typing, ends a retyping of a link.
+  if (event.key.length !== 1 || event.ctrlKey || event.metaKey || event.altKey) typingIntoLink = null;
+}, true);
+
+// The browser keeps one undo history for every text box on the page, so ⌘Z
+// in a box with nothing left to undo (or with no box focused) would undo
+// typing somewhere else, such as the search box while it's out of sight.
+// Undo and redo only change the box you're in.
+document.addEventListener("beforeinput", (event) => {
+  if (event.inputType.startsWith("history") && event.target !== document.activeElement) event.preventDefault();
+}, true);
+
+// Undo while editing an item, or in an add box, is its own. The browser keeps
+// one history for every text box on the page, so its undo could leave the box
+// and undo an earlier edit somewhere else.
+const editHistory = { host: null, past: [], future: [], at: 0 };
+const hasOwnUndo = (host) => host?.matches?.(".row.editing[data-kind='item'] .title, .add-line .add-box");
+
+function caretOffset(root) {
+  const selection = getSelection();
+  if (!selection.rangeCount) return 0;
+  const range = document.createRange();
+  range.selectNodeContents(root);
+  range.setEnd(selection.getRangeAt(0).endContainer, selection.getRangeAt(0).endOffset);
+  return range.toString().length;
+}
+
+function placeCaret(root, offset) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    if (offset <= node.length) {
+      getSelection().collapse(node, offset);
+      return;
+    }
+    offset -= node.length;
+  }
+  getSelection().selectAllChildren(root);
+  getSelection().collapseToEnd();
+}
+
+const editState = (host) => ({ html: host.innerHTML, caret: caretOffset(host) });
+
+// Typing within a moment of the last change undoes together, as a word or phrase.
+function rememberEdit(host) {
+  if (host !== editHistory.host) Object.assign(editHistory, { host, past: [], future: [], at: 0 });
+  if (Date.now() - editHistory.at > 700) editHistory.past.push(editState(host));
+  editHistory.future = [];
+  editHistory.at = Date.now();
+}
+
+function stepEdit(host, undo) {
+  const [from, to] = undo ? [editHistory.past, editHistory.future] : [editHistory.future, editHistory.past];
+  if (host !== editHistory.host || !from.length) return;
+  to.push(editState(host));
+  const previous = from.pop();
+  host.innerHTML = previous.html;
+  placeCaret(host, previous.caret);
+  editHistory.at = 0;
+  typingIntoLink = null;
+}
+
+document.addEventListener("keydown", (event) => {
+  const host = document.activeElement;
+  if (!hasOwnUndo(host) || !event.metaKey || event.altKey || event.ctrlKey || event.key.toLowerCase() !== "z") return;
+  event.preventDefault();
+  stepEdit(host, !event.shiftKey);
+}, true);
+
+document.addEventListener("beforeinput", (event) => {
+  const host = document.activeElement;
+  if (!hasOwnUndo(host)) return;
+  // The Edit menu's Undo and Redo would reach the shared history, so they do nothing here.
+  if (event.inputType.startsWith("history")) event.preventDefault();
+  else if (event.target === host) rememberEdit(host);
+}, true);
+
+document.addEventListener("paste", () => {
+  const host = document.activeElement;
+  if (!hasOwnUndo(host)) return;
+  rememberEdit(host);
+  editHistory.at = 0;
+}, true);
+
+// ── Drawing Explore ─────────────────────────────────────────────────────────
+
+function renderExploreAreas() {
+  const section = document.createElement("section");
+  section.className = "plain-list";
+  const list = document.createElement("ul");
+  list.className = "rows";
+  exploreAreas().forEach((area, index) => {
+    const row = document.createElement("li");
+    row.className = "row area-row";
+    row.dataset.index = String(index);
+    row.dataset.key = area.name;
+    const title = document.createElement("span");
+    title.className = "title";
+    title.textContent = area.name;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    const open = openCount(area);
+    meta.textContent = open ? String(open) : "";
+    row.append(title, meta);
+    row.addEventListener("click", () => {
+      if (!row.querySelector("[contenteditable]")) openRoadmapTopic(area.name);
+    });
+    row.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      openMenu(event, areaMenu(index));
+    });
+    makeReorderable(row, list, (from, to, after) => changeExplore((areas) => moveInList(areas, from, to, after)));
+    rowActions.set(row, {
+      activate: () => openRoadmapTopic(area.name),
+      edit: () => startAreaRename(index),
+      remove: () => deleteArea(index),
+      move: (step) => moveArea(index, step),
+    });
+    list.append(row);
+  });
+  section.append(list, addLineRow("New area", (name) => {
+    if (areaNameTaken(name)) {
+      showToast(`There's already an area called “${name}”.`);
+      return false;
+    }
+    changeExplore((areas) => {
+      areas.push({ name, items: [], sections: [] });
+    });
+  }, { draft: "areas" }));
   return section;
 }
 
-function renderRoadmapTopicEnlarged(topic, items, topicIdx) {
-  const container = document.createElement("div");
-  container.className = "enlarged-topic-view";
-
-  const topbar = document.createElement("div");
-  topbar.className = "enlarged-topic-topbar";
-
-  const backBtn = document.createElement("button");
-  backBtn.type = "button";
-  backBtn.className = "topic-back";
-  backBtn.textContent = "← All topics";
-  backBtn.addEventListener("click", showAllRoadmapTopics);
-
-  topbar.append(backBtn);
-
-  const card = document.createElement("div");
-  card.className = "enlarged-topic-card";
-
-  const header = document.createElement("div");
-  header.className = "enlarged-topic-header";
-
-  const title = document.createElement("h2");
-  title.className = "enlarged-topic-title";
-  title.textContent = topic.name;
-  header.append(title);
-  card.append(header);
-
-  const books = items.filter((item) => String(item.type || "").toLowerCase() === "book");
-  const otherItems = items.filter((item) => String(item.type || "").toLowerCase() !== "book");
-  const sections = document.createElement("div");
-  sections.className = "topic-resource-sections";
-  sections.append(
-    renderTopicResourceSection("Items", otherItems, topic, topicIdx, "idea"),
-    renderTopicResourceSection("Books", books, topic, topicIdx, "book"),
-  );
-  card.append(sections);
-  container.append(topbar, card);
-  return container;
+function renderExploreItemRow(place, itemIndex, item) {
+  const row = document.createElement("li");
+  row.className = `row${item.done ? " is-done" : ""}`;
+  row.dataset.index = String(itemIndex);
+  row.dataset.place = place.join(".");
+  row.dataset.key = `item:${row.dataset.place}:${itemIndex}`;
+  row.dataset.kind = "item";
+  row.innerHTML = `
+    <button class="check" type="button" role="checkbox" tabindex="-1">${CHECK_ICON}</button>
+    <span class="title"></span>
+    <span class="actions"><button class="action" type="button" tabindex="-1" title="Delete" aria-label="Delete">${TRASH_ICON}</button></span>`;
+  const check = row.querySelector(".check");
+  check.setAttribute("aria-checked", String(item.done));
+  check.setAttribute("aria-label", item.done ? "Mark not done" : "Mark done");
+  check.addEventListener("click", () => toggleExploreItem(place, itemIndex));
+  showLinks(row.querySelector(".title"), item.title);
+  row.querySelector(".action").addEventListener("click", (event) => {
+    // The next item slides under the mouse, and a double-click should not take it too.
+    if (event.detail <= 1) deleteExploreItem(place, itemIndex);
+  });
+  // Click anywhere on an item to edit it, with the caret where you clicked;
+  // links open instead.
+  row.addEventListener("click", (event) => {
+    if (row.classList.contains("editing") || event.target.closest("button")) return;
+    const link = event.target.closest("a[href]");
+    if (link) {
+      openExploreLink(event, link);
+      return;
+    }
+    beginItemEdit(row, { x: event.clientX, y: event.clientY });
+  });
+  row.addEventListener("contextmenu", (event) => {
+    if (row.classList.contains("editing")) return;
+    event.preventDefault();
+    openMenu(event, itemMenu(place, itemIndex, row));
+  });
+  rowActions.set(row, {
+    activate: () => toggleExploreItem(place, itemIndex),
+    edit: () => beginItemEdit(row),
+    remove: () => deleteExploreItem(place, itemIndex),
+    move: (step) => moveExploreItem(place, itemIndex, step),
+  });
+  if (!item.done) makeExploreDraggable(row, { kind: "item", place, index: itemIndex });
+  return row;
 }
 
-function renderRoadmapTopicCard(topic) {
-  const card = document.createElement("button");
-  card.type = "button";
-  card.className = "topic-card";
-  card.addEventListener("click", () => openRoadmapTopic(topic.name));
-
-  const titleEl = document.createElement("span");
-  titleEl.className = "topic-card-title";
-  titleEl.textContent = topic.name || "General";
-  card.append(titleEl);
-  return card;
+// Links in item titles: notes open in Zetesis, everything else in a new tab.
+function openExploreLink(event, link) {
+  const url = new URL(link.href, location.origin);
+  if (url.origin !== location.origin || !url.searchParams.has("note")) return;
+  event.preventDefault();
+  const doc = state.documents.find((candidate) => candidate.path === url.searchParams.get("note"));
+  if (doc) revealDocument(doc);
+  else showToast("That note isn't in Zetesis.");
 }
+
+function exploreDoneOpen(name) {
+  try {
+    return localStorage.getItem(`zetesis.explore.done.${name}`) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setExploreDoneOpen(name, open) {
+  try {
+    localStorage.setItem(`zetesis.explore.done.${name}`, open ? "1" : "0");
+  } catch { /* Remembering it is optional. */ }
+}
+
+function renderExploreArea(areaIndex) {
+  const section = document.createElement("section");
+  section.className = "plain-list";
+  section.append(...renderExploreList([areaIndex]));
+  return section;
+}
+
+// The inside of an area or section: its open items and add box, the sections
+// in it, then what's done.
+function renderExploreList(place) {
+  const list = exploreNode(exploreAreas(), place);
+  const key = exploreTrail(place).join("/");
+  const open = document.createElement("ul");
+  open.className = "rows";
+  const done = document.createElement("ul");
+  done.className = "rows is-done-list";
+  list.items.forEach((item, itemIndex) => (item.done ? done : open).append(renderExploreItemRow(place, itemIndex, item)));
+  const box = addLineRow("Add item", (text) => addToExplore(place, text), { draft: `area:${key}`, links: true, maxLength: 2000 });
+  box.dataset.place = place.join(".");
+  // "# Name" makes a section, so the box shows it as a heading.
+  const field = box.querySelector(".add-box");
+  const showHeading = () => box.classList.toggle("is-heading", /^#\s/.test(field.textContent));
+  field.addEventListener("input", showHeading);
+  showHeading();
+  const parts = [open, box, ...list.sections.map((_, index) => renderExploreSection([...place, index]))];
+  if (done.children.length) {
+    const showDone = exploreDoneOpen(key);
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "done-toggle";
+    toggle.textContent = `${done.children.length} done`;
+    toggle.setAttribute("aria-expanded", String(showDone));
+    toggle.addEventListener("click", () => {
+      setExploreDoneOpen(key, !showDone);
+      renderRoadmap();
+    });
+    done.hidden = !showDone;
+    parts.push(toggle, done);
+  }
+  return parts;
+}
+
+// A section's heading (click to open or close it), then, when open, its list.
+function renderExploreSection(place) {
+  const section = exploreNode(exploreAreas(), place);
+  const open = sectionOpen(place);
+  const wrapper = document.createElement("div");
+  wrapper.className = "explore-section";
+  const head = document.createElement("ul");
+  head.className = "rows";
+  const row = document.createElement("li");
+  row.className = `row section-row${open ? " is-open" : ""}`;
+  row.dataset.kind = "section";
+  row.dataset.place = place.join(".");
+  row.dataset.key = `section:${row.dataset.place}`;
+  row.setAttribute("aria-expanded", String(open));
+  row.innerHTML = `<button class="caret" type="button" tabindex="-1">${chevronSvg}</button><span class="title"></span><span class="meta"></span>`;
+  row.querySelector(".caret").setAttribute("aria-label", open ? "Collapse" : "Expand");
+  row.querySelector(".title").textContent = section.name;
+  const count = openCount(section);
+  row.querySelector(".meta").textContent = count ? String(count) : "";
+  row.addEventListener("click", () => {
+    if (!row.classList.contains("editing")) toggleSection(place);
+  });
+  row.addEventListener("contextmenu", (event) => {
+    if (row.classList.contains("editing")) return;
+    event.preventDefault();
+    openMenu(event, sectionMenu(place));
+  });
+  rowActions.set(row, {
+    activate: () => toggleSection(place),
+    edit: () => startSectionRename(place),
+    remove: () => deleteSection(place),
+    move: (step) => moveSection(place, step),
+  });
+  makeExploreDraggable(row, { kind: "section", place });
+  head.append(row);
+  wrapper.append(head);
+  if (open) {
+    const body = document.createElement("div");
+    body.className = "section-body";
+    body.append(...renderExploreList(place));
+    wrapper.append(body);
+  }
+  return wrapper;
+}
+
+// Dragging in an area: an item before or after another, onto a section's
+// heading (to the top of it), or onto a list's add box (to the end); a
+// section before or after another, or onto one's middle to go inside it.
+let exploreDrag = null;
+
+function makeExploreDraggable(row, drag) {
+  row.draggable = true;
+  row.addEventListener("dragstart", (event) => {
+    exploreDrag = { ...drag, row };
+    row.classList.add("dragging");
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", row.querySelector(".title")?.textContent || "");
+  });
+  row.addEventListener("dragend", () => {
+    row.classList.remove("dragging");
+    exploreDrag = null;
+    markExploreDrop(null);
+  });
+}
+
+function exploreDropAt(event) {
+  if (!exploreDrag) return null;
+  const element = event.target.closest?.(".row[data-kind], .add-line[data-place]");
+  if (!element || element === exploreDrag.row || element.matches(".is-done, .editing")) return null;
+  const rect = element.getBoundingClientRect();
+  const y = (event.clientY - rect.top) / rect.height;
+  if (exploreDrag.kind === "item") {
+    return { element, mode: element.dataset.kind !== "item" ? "into" : y < 0.5 ? "before" : "after" };
+  }
+  if (element.dataset.kind !== "section" || within(placeOf(element), exploreDrag.place)) return null;
+  return { element, mode: y < 0.25 ? "before" : y > 0.75 ? "after" : "into" };
+}
+
+function markExploreDrop(target) {
+  for (const marked of roadmapTopics.querySelectorAll(".drop-before, .drop-after, .drop-into")) {
+    marked.classList.remove("drop-before", "drop-after", "drop-into");
+  }
+  target?.element.classList.add(`drop-${target.mode}`);
+}
+
+function dropInExplore(drag, { element, mode }) {
+  const to = placeOf(element);
+  if (mode === "into" && element.dataset.kind === "section") setSectionOpen(to, true);
+  if (drag.kind === "section") {
+    if (mode === "into") moveSectionTo(drag.place, to);
+    else moveSectionTo(drag.place, to.slice(0, -1), { beside: to, after: mode === "after" });
+    return;
+  }
+  changeExplore((areas) => {
+    const list = exploreNode(areas, to);
+    const anchor = element.dataset.kind === "item" ? list.items[Number(element.dataset.index)] : null;
+    const [moved] = exploreNode(areas, drag.place).items.splice(drag.index, 1);
+    if (anchor) list.items.splice(list.items.indexOf(anchor) + (mode === "after" ? 1 : 0), 0, moved);
+    else if (element.dataset.kind === "section") list.items.unshift(moved);
+    else list.items.push(moved);
+  });
+}
+
+roadmapTopics.addEventListener("dragover", (event) => {
+  if (!exploreDrag) return;
+  const target = exploreDropAt(event);
+  markExploreDrop(target);
+  if (target) event.preventDefault();
+});
+
+// Chrome names nothing it leaves for, so only a pointer outside the list clears the marker.
+roadmapTopics.addEventListener("dragleave", (event) => {
+  const rect = roadmapTopics.getBoundingClientRect();
+  if (exploreDrag && (event.clientX < rect.left || event.clientX >= rect.right || event.clientY < rect.top || event.clientY >= rect.bottom)) {
+    markExploreDrop(null);
+  }
+});
+
+roadmapTopics.addEventListener("drop", (event) => {
+  const target = exploreDropAt(event);
+  if (!target) return;
+  event.preventDefault();
+  const drag = exploreDrag;
+  markExploreDrop(null);
+  dropInExplore(drag, target);
+});
+
+// Right-click beside an area's lines for a new section.
+$(".main-area").addEventListener("contextmenu", (event) => {
+  const areaIndex = state.view === "roadmap" ? currentAreaIndex() : -1;
+  if (areaIndex < 0 || event.target.closest(".row, .add-line, button, a, [contenteditable], dialog, .context-menu")) return;
+  event.preventDefault();
+  openMenu(event, [{ label: "New section", onPick: () => startNewSection([areaIndex]) }]);
+});
 
 function renderRoadmap() {
   if (!state.roadmap) return;
-
+  const areas = exploreAreas();
+  if (state.roadmapTopic && !areas.some((area) => area.name === state.roadmapTopic)) {
+    state.roadmapTopic = "";
+    history.replaceState(null, "", "/?view=roadmap");
+  }
   updateRoadmapCounts();
   updateRoadmapHeading();
-  roadmapTopics.replaceChildren();
-
-  const topics = state.roadmap.topics || [];
-  // If a topic is selected, render enlarged view for that topic
-  if (state.roadmapTopic) {
-    const topicIdx = topics.findIndex((t) => t.name === state.roadmapTopic);
-    if (topicIdx >= 0) {
-      const topic = topics[topicIdx];
-      const items = (topic.items || []).filter(roadmapItemMatches);
-      roadmapTopics.append(renderRoadmapTopicEnlarged(topic, items, topicIdx));
-      return;
-    }
-  }
-
-  // All topics view
-  const visibleTopics = topics
-    .map((topic, idx) => ({ topic, items: (topic.items || []).filter(roadmapItemMatches), topicIdx: idx }))
-    .filter(({ items }) => items.length > 0 || topics.length <= 5);
-
-  if (!visibleTopics.length) {
-    return;
-  }
-
-  const grid = document.createElement("div");
-  grid.className = "topic-index-grid";
-  for (const { topic, items, topicIdx } of visibleTopics) {
-    grid.append(renderRoadmapTopicCard(topic));
-  }
-  roadmapTopics.append(grid);
+  const areaIndex = currentAreaIndex();
+  redrawList(roadmapTopics, areaIndex >= 0 ? renderExploreArea(areaIndex) : renderExploreAreas());
 }
 
 function renderCard(doc) {
@@ -1848,11 +2472,98 @@ function renderCard(doc) {
   card.addEventListener("click", () => selectDocument(doc));
   card.addEventListener("dragstart", (event) => {
     state.draggedNotePath = doc.path;
+    card.classList.add("dragging");
     event.dataTransfer?.setData("text/plain", doc.path);
     if (event.dataTransfer) event.dataTransfer.effectAllowed = "move";
   });
-  card.addEventListener("dragend", () => { state.draggedNotePath = ""; });
+  card.addEventListener("dragend", () => {
+    state.draggedNotePath = "";
+    card.classList.remove("dragging");
+    clearNoteDropMarker();
+  });
   return card;
+}
+
+// Dragging a card within the list rearranges the notes (a drop on a sidebar
+// folder moves the note instead). Search results keep their ranking.
+function noteDropTarget(clientY) {
+  const cards = [...noteList.querySelectorAll(".note-card")].filter((card) => card.dataset.path !== state.draggedNotePath);
+  const before = cards.find((card) => {
+    const rect = card.getBoundingClientRect();
+    return clientY < rect.top + rect.height / 2;
+  });
+  return before ? { card: before, after: false } : { card: cards.at(-1) || null, after: true };
+}
+
+function clearNoteDropMarker() {
+  for (const card of noteList.querySelectorAll(".drop-before, .drop-after")) {
+    card.classList.remove("drop-before", "drop-after");
+  }
+}
+
+noteList.addEventListener("dragover", (event) => {
+  if (!state.draggedNotePath || state.query) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+  const target = noteDropTarget(event.clientY);
+  clearNoteDropMarker();
+  target.card?.classList.add(target.after ? "drop-after" : "drop-before");
+});
+
+noteList.addEventListener("dragleave", (event) => {
+  if (!noteList.contains(event.relatedTarget)) clearNoteDropMarker();
+});
+
+noteList.addEventListener("drop", (event) => {
+  const dragged = state.draggedNotePath;
+  if (!dragged || state.query) return;
+  event.preventDefault();
+  const target = noteDropTarget(event.clientY);
+  clearNoteDropMarker();
+  state.draggedNotePath = "";
+  const current = getVisibleDocuments().map((doc) => doc.path);
+  if (!current.includes(dragged)) return;
+  const paths = current.filter((path) => path !== dragged);
+  const index = target.card ? paths.indexOf(target.card.dataset.path) + (target.after ? 1 : 0) : paths.length;
+  paths.splice(index, 0, dragged);
+  if (paths.every((path, i) => path === current[i])) return;
+  reorderNotes(paths);
+});
+
+// The rearranged notes swap among the places they already hold in the full
+// list, exactly as the server does, so other folders keep their order.
+function orderDocuments(documents, paths) {
+  const moving = new Set(paths);
+  const byPath = new Map(documents.map((doc) => [doc.path, doc]));
+  const next = [...documents];
+  let i = 0;
+  documents.forEach((doc, slot) => {
+    if (moving.has(doc.path)) next[slot] = byPath.get(paths[i++]);
+  });
+  return next;
+}
+
+async function reorderNotes(paths) {
+  const previous = state.documents;
+  state.documents = orderDocuments(previous, paths);
+  updateList();
+  try {
+    const response = await fetch("/api/notes/order", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Could not save the note order.");
+    // Adopt the server's full order in case this page's list was out of date.
+    const rank = new Map(result.order.map((path, index) => [path, index]));
+    state.documents = [...state.documents].sort((a, b) => (rank.get(a.path) ?? rank.size) - (rank.get(b.path) ?? rank.size));
+  } catch (error) {
+    state.documents = previous;
+    showToast(error.message);
+  }
+  if (!state.query) state.results = state.documents;
+  updateList();
 }
 
 function updateList() {
@@ -1874,6 +2585,9 @@ function updateList() {
   }
 
   updateHeading();
+  // Searching a folder selects the top note, so Enter opens it.
+  if (state.query && document.activeElement === searchInput) setNav(0);
+  else showNav();
   if (state.selected && !visible.some((d) => d.path === state.selected.path)) {
     // Keep the open note visible while removing its row highlight from the filtered list.
     for (const c of noteList.querySelectorAll(".note-card")) c.classList.remove("selected");
@@ -1898,7 +2612,9 @@ function renderInline(raw, docPath) {
   let text = raw;
 
   const addToken = (html) => {
-    const token = `__FIELDNOTES_TOKEN_${tokens.length}__`;
+    // Private-use characters, so no inline markup rule can match a token
+    // (underscores did: two links on a line turned bold).
+    const token = `\uE000${tokens.length}\uE001`;
     tokens.push([token, html]);
     return token;
   };
@@ -1961,73 +2677,50 @@ function renderInline(raw, docPath) {
   return html;
 }
 
-function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
+// Read-only rendering for notes that still have only their legacy Org or
+// Markdown body (not yet converted to blocks, or conversion failed).
+function renderTextDocument(source, doc) {
   const lines = source.replace(/\r\n?/g, "\n").split("\n");
   const output = [];
   let paragraph = [];
-  let paragraphSource = [];
   let list = [];
-  let listSource = [];
   let listType = "";
   let blockquote = [];
-  let blockquoteSource = [];
   let tableRows = [];
-  let tableSource = [];
   let code = null;
-  let pendingSource = [];
-  let pendingGap = [];
   let firstHeadingSeen = false;
-
-  const sourceAttributes = (sourceText, prefix = "", gap = "") => (
-    ' data-source="' + encodeURIComponent(sourceText) + '"' +
-    (prefix ? ' data-prefix="' + encodeURIComponent(prefix) + '"' : "") +
-    (gap ? ' data-gap="' + encodeURIComponent(gap) + '"' : "")
-  );
-  const pushBlock = (tag, inner, sourceText, selfClosing = false) => {
-    const prefix = pendingSource.join("\n");
-    pendingSource = [];
-    const gap = "\n".repeat(pendingGap.length + (output.length ? 1 : 0));
-    pendingGap = [];
-    const attributes = sourceAttributes(sourceText, prefix, gap);
-    output.push(selfClosing ? "<" + tag + attributes + ">" : "<" + tag + attributes + ">" + inner + "</" + tag + ">");
-  };
 
   const flushParagraph = () => {
     if (paragraph.length) {
-      pushBlock("p", paragraph.map((line) => renderInline(line, doc.path)).join("<br>"), paragraphSource.join("\n"));
+      output.push("<p>" + paragraph.map((line) => renderInline(line, doc.path)).join("<br>") + "</p>");
       paragraph = [];
-      paragraphSource = [];
     }
   };
 
   const flushList = () => {
     if (list.length) {
-      pushBlock(listType, list.map((item) => "<li>" + renderInline(item, doc.path) + "</li>").join(""), listSource.join("\n"));
+      output.push("<" + listType + ">" + list.map((item) => "<li>" + renderInline(item, doc.path) + "</li>").join("") + "</" + listType + ">");
       list = [];
-      listSource = [];
       listType = "";
     }
   };
 
   const flushBlockquote = () => {
     if (blockquote.length) {
-      pushBlock("blockquote", "<p>" + blockquote.map((line) => renderInline(line, doc.path)).join("<br>") + "</p>", blockquoteSource.join("\n"));
+      output.push("<blockquote><p>" + blockquote.map((line) => renderInline(line, doc.path)).join("<br>") + "</p></blockquote>");
       blockquote = [];
-      blockquoteSource = [];
     }
   };
 
   const flushTable = () => {
     if (tableRows.length) {
       const rowsHtml = tableRows.map((row, idx) => {
-        const isHeader = idx === 0;
-        const tag = isHeader ? "th" : "td";
+        const tag = idx === 0 ? "th" : "td";
         const cells = row.split("|").slice(1, -1).map((cell) => "<" + tag + ">" + renderInline(cell.trim(), doc.path) + "</" + tag + ">").join("");
         return "<tr>" + cells + "</tr>";
       }).join("");
-      pushBlock("table", "<tbody>" + rowsHtml + "</tbody>", tableSource.join("\n"));
+      output.push("<table><tbody>" + rowsHtml + "</tbody></table>");
       tableRows = [];
-      tableSource = [];
     }
   };
 
@@ -2040,31 +2733,27 @@ function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
 
   for (const line of lines) {
     const orgCodeStart = line.match(/^\s*#\+begin_src(?:\s+(\S+))?/i);
-    const mdCodeStart = line.match(/^\s*(\u0060{3})(.*)$/);
+    const mdCodeStart = line.match(/^\s*(`{3})(.*)$/);
 
     if (code) {
-      const endCode = code.org ? /^\s*#\+end_src\s*$/i.test(line) : /^\s*\u0060{3}\s*$/.test(line);
+      const endCode = code.org ? /^\s*#\+end_src\s*$/i.test(line) : /^\s*`{3}\s*$/.test(line);
       if (endCode) {
-        code.source.push(line);
-        pushBlock("pre", "<code>" + escapeHtml(code.lines.join("\n")) + "</code>", code.source.join("\n"));
+        output.push("<pre><code>" + escapeHtml(code.lines.join("\n")) + "</code></pre>");
         code = null;
       } else {
         code.lines.push(line);
-        code.source.push(line);
       }
       continue;
     }
 
     if (orgCodeStart || mdCodeStart) {
       flushAll();
-      code = { org: Boolean(orgCodeStart), lines: [], source: [line] };
+      code = { org: Boolean(orgCodeStart), lines: [] };
       continue;
     }
 
-    if (/^\s*#\+/.test(line) || /^\s*<!--/.test(line)) {
-      pendingSource.push(line);
-      continue;
-    }
+    // Org directives and HTML comments are not shown.
+    if (/^\s*#\+/.test(line) || /^\s*<!--/.test(line)) continue;
 
     const heading = doc.extension === ".org"
       ? line.match(/^\s*(\*{1,6})\s+(.+?)\s*$/)
@@ -2072,20 +2761,15 @@ function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
 
     if (heading) {
       flushAll();
-      const level = Math.min(6, heading[1].length);
-      const text = heading[2].replace(/\s+#+\s*$/, "");
-      if (!firstHeadingSeen) {
-        pushBlock("h1", renderInline(text, doc.path), line);
-        firstHeadingSeen = true;
-      } else {
-        pushBlock("h" + level, renderInline(text, doc.path), line);
-      }
+      const level = firstHeadingSeen ? Math.min(6, heading[1].length) : 1;
+      firstHeadingSeen = true;
+      output.push("<h" + level + ">" + renderInline(heading[2].replace(/\s+#+\s*$/, ""), doc.path) + "</h" + level + ">");
       continue;
     }
 
     if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(line)) {
       flushAll();
-      pushBlock("hr", "", line, true);
+      output.push("<hr>");
       continue;
     }
 
@@ -2093,12 +2777,7 @@ function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
       flushParagraph();
       flushList();
       flushBlockquote();
-      if (!/^\s*\|[-+\s|]+\|\s*$/.test(line)) {
-        tableRows.push(line.trim());
-        tableSource.push(line);
-      } else {
-        tableSource.push(line);
-      }
+      if (!/^\s*\|[-+\s|]+\|\s*$/.test(line)) tableRows.push(line.trim());
       continue;
     } else if (tableRows.length) {
       flushTable();
@@ -2109,7 +2788,6 @@ function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
       flushList();
       flushTable();
       blockquote.push(line.replace(/^\s*>\s?/, ""));
-      blockquoteSource.push(line);
       continue;
     } else if (blockquote.length) {
       flushBlockquote();
@@ -2124,7 +2802,6 @@ function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
       if (listType && listType !== nextType) flushList();
       listType = nextType;
       list.push(listItem[2]);
-      listSource.push(line);
       continue;
     } else if (list.length) {
       flushList();
@@ -2132,24 +2809,16 @@ function renderTextDocument(source, doc, { includeFallbackTitle = true } = {}) {
 
     if (!line.trim()) {
       flushAll();
-      if (pendingSource.length) pendingSource.push(line);
-      else pendingGap.push(line);
       continue;
     }
 
     paragraph.push(line.trim());
-    paragraphSource.push(line);
   }
 
-  if (code) pushBlock("pre", "<code>" + escapeHtml(code.lines.join("\n")) + "</code>", code.source.join("\n"));
+  if (code) output.push("<pre><code>" + escapeHtml(code.lines.join("\n")) + "</code></pre>");
   flushAll();
 
-  if (pendingSource.length) {
-    const gap = "\n".repeat(pendingGap.length + (output.length ? 1 : 0));
-    output.push('<span hidden data-source-only="' + encodeURIComponent(pendingSource.join("\n")) + '" data-gap="' + encodeURIComponent(gap) + '"></span>');
-  }
-
-  if (includeFallbackTitle && !firstHeadingSeen && doc.title) {
+  if (!firstHeadingSeen && doc.title) {
     output.unshift("<h1>" + escapeHtml(doc.title) + "</h1>");
   }
 
@@ -2563,14 +3232,9 @@ async function deletePdfHighlight(session, highlightId) {
 function clearReader({ resetUrl = false } = {}) {
   disposePdfViewer();
   if (noteViewer.open) noteViewer.close();
-  noteViewer.classList.remove("is-fullscreen");
-  const fullscreenButton = $("#fullscreen-note-viewer");
-  fullscreenButton.textContent = "⛶";
-  fullscreenButton.setAttribute("aria-label", "Enter fullscreen");
-  fullscreenButton.title = "Enter fullscreen";
+  closeEditorSession();
   state.selected = null;
   state.selectedPayload = null;
-  state.editorSession = null;
   state.documentRequestId += 1;
   readerContent.hidden = true;
   readerContent.style.display = "none";
@@ -2589,18 +3253,10 @@ function clearReader({ resetUrl = false } = {}) {
   }
 }
 
-function closeNoteViewer() {
-  if (!confirmDiscardEditor()) return false;
+function closeNoteViewer({ retry = null } = {}) {
+  if (!confirmDiscardEditor(retry || (() => closeNoteViewer()))) return false;
   clearReader({ resetUrl: true });
   return true;
-}
-
-function toggleNoteViewerFullscreen() {
-  const fullscreen = noteViewer.classList.toggle("is-fullscreen");
-  const button = $("#fullscreen-note-viewer");
-  button.textContent = fullscreen ? "↙" : "⛶";
-  button.setAttribute("aria-label", fullscreen ? "Exit fullscreen" : "Enter fullscreen");
-  button.title = fullscreen ? "Exit fullscreen" : "Enter fullscreen";
 }
 
 function readerButton(label, className, action) {
@@ -2612,27 +3268,34 @@ function readerButton(label, className, action) {
   return button;
 }
 
-function renderSelectedDocument(doc, payload) {
+function renderSelectedDocument(doc, payload, { focus = "" } = {}) {
   disposePdfViewer();
+  closeEditorSession();
   state.selectedPayload = payload;
-  state.editorSession = null;
   readerContent.hidden = false;
   readerContent.style.display = "block";
   readerContent.replaceChildren();
 
+  const isPdf = doc.extension === ".pdf";
+  const isBlockNote = !isPdf && Boolean(payload.body);
   const toolbar = document.createElement("div");
   toolbar.className = "reader-toolbar";
   const location = document.createElement("span");
   location.className = "reader-location";
-  location.textContent = `${state.collections[doc.collection] || formatFolderName(doc.collection)} · ${doc.title}`;
+  location.textContent = isBlockNote
+    ? formatFolderPath(doc.folder || doc.collection)
+    : `${state.collections[doc.collection] || formatFolderName(doc.collection)} · ${doc.title}`;
   const actions = document.createElement("span");
   actions.className = "reader-actions";
+  const status = document.createElement("span");
+  status.className = "save-status";
+  status.setAttribute("role", "status");
   const type = document.createElement("span");
   type.className = "reader-type";
   type.textContent = doc.extension.slice(1);
-  actions.append(type);
+  actions.append(status, type);
 
-  if (doc.extension === ".pdf") {
+  if (isPdf) {
     const open = document.createElement("a");
     open.className = "reader-link";
     open.href = `/api/file?path=${encodeURIComponent(doc.path)}`;
@@ -2641,438 +3304,417 @@ function renderSelectedDocument(doc, payload) {
     open.textContent = "Open PDF ↗";
     actions.append(open);
   }
-
-  if (TEXT_EXTENSIONS_FOR_UI.has(doc.extension)) {
-    actions.append(readerButton("Edit", "", () => startEditingNote(doc, payload)));
-  }
   actions.append(readerButton("Delete", "danger-button", () => deleteNote(doc.path)));
   toolbar.append(location, actions);
   readerContent.append(toolbar);
 
-  if (doc.extension === ".pdf") {
+  if (isPdf) {
     readerContent.append(createPdfViewer(doc));
+  } else if (isBlockNote) {
+    openBlockEditor(doc, payload, status, { focus });
   } else {
-    const article = document.createElement("div");
-    article.className = "document-article";
-    article.innerHTML = renderTextDocument(payload.content || "", doc);
-    readerContent.append(article);
+    renderLegacyNote(doc, payload);
   }
 }
 
-function decodeEditorSource(value) {
-  try {
-    return decodeURIComponent(value || "");
-  } catch {
-    return value || "";
-  }
-}
-
-function relativeLinkTarget(target, documentPath) {
-  const from = documentPath.split("/").slice(0, -1).filter(Boolean);
-  const to = String(target || "").replace(/^\/+/, "").split("/").filter(Boolean);
-  let common = 0;
-  while (common < from.length && common < to.length && from[common] === to[common]) common += 1;
-  const parts = Array(from.length - common).fill("..").concat(to.slice(common));
-  return parts.join("/") || ".";
-}
-
-function resourcePathFromUrl(value) {
-  try {
-    const url = new URL(value, window.location.origin);
-    if (url.pathname === "/" && url.searchParams.has("note")) {
-      return { kind: "note", path: url.searchParams.get("note") };
-    }
-    if (url.pathname === "/api/file" && url.searchParams.has("path")) {
-      return { kind: "file", path: url.searchParams.get("path") };
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-
-function serializeInlineNode(node, extension, documentPath) {
-  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.replace(/\u00a0/g, " ");
-  if (node.nodeType !== Node.ELEMENT_NODE) return "";
-
-  const tag = node.tagName.toLowerCase();
-  if (tag === "br") return "\n";
-  if (tag === "img") {
-    const alt = node.getAttribute("alt") || "";
-    const resource = resourcePathFromUrl(node.getAttribute("src") || "");
-    const target = resource
-      ? relativeLinkTarget(resource.path, documentPath)
-      : (node.getAttribute("src") || "");
-    return extension === ".org"
-      ? "[[file:" + target + "][" + alt + "]]"
-      : "![" + alt + "](" + target + ")";
-  }
-
-  const inner = Array.from(node.childNodes)
-    .map((child) => serializeInlineNode(child, extension, documentPath))
-    .join("");
-  if (tag === "strong" || tag === "b") {
-    return extension === ".org" ? "*" + inner + "*" : "**" + inner + "**";
-  }
-  if (tag === "em" || tag === "i") return extension === ".org" ? "/" + inner + "/" : "*" + inner + "*";
-  if (tag === "code") return extension === ".org" ? "~" + inner + "~" : "\u0060" + inner + "\u0060";
-  if (tag !== "a") return inner;
-
-  const href = node.getAttribute("href") || "";
-  const resource = resourcePathFromUrl(href);
-  const label = inner || href;
-  if (resource) {
-    const target = relativeLinkTarget(resource.path, documentPath);
-    return extension === ".org"
-      ? "[[file:" + target + "][" + label + "]]"
-      : "[" + label + "](" + target + ")";
-  }
-  return extension === ".org"
-    ? "[[" + href + "][" + label + "]]"
-    : "[" + label + "](" + href + ")";
-}
-
-function serializeInlineNodes(nodes, extension, documentPath) {
-  return Array.from(nodes)
-    .map((node) => serializeInlineNode(node, extension, documentPath))
-    .join("");
-}
-
-function serializeEditableBlock(node, extension, documentPath, originalSource = "") {
-  if (node.nodeType === Node.TEXT_NODE) return node.nodeValue.trim();
-  if (node.nodeType !== Node.ELEMENT_NODE) return "";
-
-  const tag = node.tagName.toLowerCase();
-  const inline = serializeInlineNodes(node.childNodes, extension, documentPath);
-  const heading = tag.match(/^h([1-6])$/);
-  if (heading) {
-    let level = Number(heading[1]);
-    const originalHeading = originalSource.split("\n").find((line) =>
-      extension === ".org" ? /^\s*\*{1,6}\s+/.test(line) : /^\s{0,3}#{1,6}\s+/.test(line)
-    );
-    if (originalHeading) {
-      const originalLevel = extension === ".org"
-        ? originalHeading.match(/^\s*(\*{1,6})\s+/)?.[1].length
-        : originalHeading.match(/^\s{0,3}(#{1,6})\s+/)?.[1].length;
-      if (originalLevel) level = originalLevel;
-    }
-    const marks = extension === ".org" ? "*".repeat(level) : "#".repeat(level);
-    return marks + " " + inline.trim();
-  }
-  if (tag === "p") return inline.trim();
-  if (tag === "ul" || tag === "ol") {
-    return Array.from(node.children).filter((child) => child.tagName.toLowerCase() === "li")
-      .map((item, index) => {
-        const content = serializeInlineNodes(item.childNodes, extension, documentPath).trim();
-        return tag === "ol" ? (index + 1) + ". " + content : "- " + content;
-      }).join("\n");
-  }
-  if (tag === "li") return "- " + inline.trim();
-  if (tag === "blockquote") {
-    const content = Array.from(node.children)
-      .map((child) => serializeEditableBlock(child, extension, documentPath))
-      .filter(Boolean)
-      .join("\n");
-    return content.split("\n").map((line) => "> " + line).join("\n");
-  }
-  if (tag === "pre") {
-    const text = node.textContent.replace(/\n+$/, "");
-    if (extension === ".org") {
-      const options = originalSource.match(/^\s*#\+begin_src(.*)$/im)?.[1] || "";
-      return "#+begin_src" + options + "\n" + text + "\n#+end_src";
-    }
-    const fenceInfo = originalSource.match(/^\s*\u0060{3}(.*)$/m)?.[1] || "";
-    return "\u0060\u0060\u0060" + fenceInfo + "\n" + text + "\n\u0060\u0060\u0060";
-  }
-  if (tag === "table") {
-    const rows = Array.from(node.querySelectorAll("tr")).map((row) =>
-      Array.from(row.children)
-        .map((cell) => serializeInlineNodes(cell.childNodes, extension, documentPath).trim())
-        .join(" | ")
-    );
-    if (rows.length > 1) {
-      const separator = rows[0].split(" | ").map(() => "---").join(extension === ".org" ? "+" : " | ");
-      rows.splice(1, 0, separator);
-    }
-    return rows.map((row) => "| " + row + " |").join("\n");
-  }
-  if (tag === "hr") return extension === ".org" ? "-----" : "---";
-  return Array.from(node.childNodes)
-    .map((child) => serializeEditableBlock(child, extension, documentPath))
-    .filter(Boolean)
-    .join("\n");
-}
-
-function serializeEditedNote(article, payload, doc, session, title) {
-  const chunks = [];
-  for (const node of article.childNodes) {
-    if (node.nodeType === Node.TEXT_NODE && !node.nodeValue.trim()) continue;
-    if (node.nodeType === Node.ELEMENT_NODE && node.dataset.sourceOnly !== undefined) {
-      chunks.push({
-        gap: decodeEditorSource(node.dataset.gap),
-        text: decodeEditorSource(node.dataset.sourceOnly),
-      });
-      continue;
-    }
-
-    const original = session.originalBlocks.get(node);
-    if (original && node.outerHTML === original.markup) {
-      chunks.push({ gap: original.gap, text: original.source });
-      continue;
-    }
-
-    const prefix = node.nodeType === Node.ELEMENT_NODE ? decodeEditorSource(node.dataset.prefix) : "";
-    const gap = node.nodeType === Node.ELEMENT_NODE ? decodeEditorSource(node.dataset.gap) : "";
-    const block = serializeEditableBlock(node, doc.extension, doc.path, original?.source || "");
-    if (block) chunks.push({ gap, text: prefix ? prefix + "\n" + block : block });
-  }
-
-  let content = chunks.filter((chunk) => chunk.text).map((chunk, index) => (
-    (chunk.gap || (index ? "\n\n" : "")) + chunk.text
-  )).join("");
-  if (doc.extension === ".org" && /^\s*#\+title\s*:/im.test(payload.content || "")) {
-    const lines = content.split("\n");
-    let foundTitle = false;
-    for (let index = 0; index < lines.length; index += 1) {
-      if (/^\s*#\+title\s*:/i.test(lines[index])) {
-        lines[index] = "#+TITLE: " + title;
-        foundTitle = true;
-        break;
-      }
-    }
-    if (!foundTitle) lines.unshift("#+TITLE: " + title, "");
-    content = lines.join("\n");
-  }
-  return content;
-}
-
-function currentTitleHeading(article, doc) {
-  if (doc.extension === ".md") return article.querySelector("h1");
-  return Array.from(article.querySelectorAll("h1"))
-    .find((heading) => heading.textContent.trim() === doc.title);
-}
-
-function topLevelEditableBlock(article, node) {
-  let element = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
-  if (!element || element === article) return null;
-  while (element.parentElement && element.parentElement !== article) {
-    element = element.parentElement;
-  }
-  return element.parentElement === article ? element : null;
-}
-
-function applyLiveBlockSyntax(article, extension, session) {
-  const selection = window.getSelection();
-  if (!selection?.rangeCount) return null;
-  const block = topLevelEditableBlock(article, selection.anchorNode);
-  if (!block || !["P", "DIV"].includes(block.tagName)) return null;
-
-  const text = block.textContent;
-  if (text.includes("\n")) return null;
-
-  let tag = "";
-  let content = "";
-  let syntaxLength = 0;
-  if (extension === ".org") {
-    const heading = text.match(/^(\*{1,6})[ \t]+(.*)$/);
-    if (heading) {
-      tag = "h" + heading[1].length;
-      content = heading[2];
-      syntaxLength = heading[1].length + heading[0].slice(heading[1].length).match(/^[ \t]+/)[0].length;
-    } else {
-      const bullet = text.match(/^[-+][ \t]+(.*)$/);
-      if (bullet) {
-        tag = "ul";
-        content = bullet[1];
-        syntaxLength = text.length - content.length;
-      }
-    }
-  } else {
-    const heading = text.match(/^(#{1,6})[ \t]+(.*)$/);
-    if (heading) {
-      tag = "h" + heading[1].length;
-      content = heading[2];
-      syntaxLength = heading[1].length + heading[0].slice(heading[1].length).match(/^[ \t]+/)[0].length;
-    } else {
-      const ordered = text.match(/^(\d+)[.)][ \t]+(.*)$/);
-      const bullet = text.match(/^[-+*][ \t]+(.*)$/);
-      if (ordered) {
-        tag = "ol";
-        content = ordered[2];
-        syntaxLength = text.length - content.length;
-      } else if (bullet) {
-        tag = "ul";
-        content = bullet[1];
-        syntaxLength = text.length - content.length;
-      }
-    }
-  }
-  if (!tag) return null;
-
-  let caretOffset = text.length;
-  try {
-    const beforeCaret = document.createRange();
-    beforeCaret.selectNodeContents(block);
-    beforeCaret.setEnd(selection.anchorNode, selection.anchorOffset);
-    caretOffset = beforeCaret.toString().length;
-  } catch {
-    // Keep the caret at the end if the browser uses an unexpected selection shape.
-  }
-
-  const replacement = document.createElement(tag);
-  for (const attribute of block.attributes) {
-    if (attribute.name.startsWith("data-")) replacement.setAttribute(attribute.name, attribute.value);
-  }
-  const item = tag === "ul" || tag === "ol" ? document.createElement("li") : replacement;
-  const textNode = document.createTextNode(content);
-  item.append(textNode);
-  if (item !== replacement) replacement.append(item);
-  block.replaceWith(replacement);
-
-  const original = session.originalBlocks.get(block);
-  if (original) session.originalBlocks.set(replacement, original);
-
-  const range = document.createRange();
-  range.setStart(textNode, Math.min(Math.max(0, caretOffset - syntaxLength), textNode.length));
-  range.collapse(true);
-  selection.removeAllRanges();
-  selection.addRange(range);
-  return replacement;
-}
-
-function startEditingNote(doc, payload) {
-  state.selectedPayload = payload;
-  state.editorSession = null;
-  readerContent.replaceChildren();
-
-  const toolbar = document.createElement("div");
-  toolbar.className = "reader-toolbar";
-  const location = document.createElement("span");
-  location.className = "reader-location";
-  location.textContent = (state.collections[doc.collection] || formatFolderName(doc.collection)) + " ·";
-
-  const titleInput = document.createElement("input");
-  titleInput.type = "text";
-  titleInput.className = "reader-title-editor";
-  titleInput.value = doc.title;
-  titleInput.maxLength = 300;
-  titleInput.setAttribute("aria-label", "Note title");
-
-  const status = document.createElement("span");
-  status.className = "save-status";
-  status.textContent = "";
-
-  const actions = document.createElement("span");
-  actions.className = "reader-actions";
-  const save = readerButton("Save", "primary-button", () => saveNote(doc, payload));
-  const cancel = readerButton("Cancel", "", () => renderSelectedDocument(doc, payload));
-  actions.append(cancel, save);
-  toolbar.append(location, titleInput, status, actions);
-
+// Notes not yet converted to blocks (or whose conversion failed) stay
+// readable in their original Org/Markdown rendering.
+function renderLegacyNote(doc, payload) {
+  const notice = document.createElement("div");
+  notice.className = "legacy-notice";
+  const message = document.createElement("span");
+  message.textContent = `This note is shown in its original ${doc.extension === ".org" ? "Org" : "Markdown"} format.`;
+  notice.append(message, readerButton("Convert to editable blocks", "secondary-button", () => convertLegacyNote(doc)));
   const article = document.createElement("div");
-  article.className = "document-article note-inline-editor";
-  article.contentEditable = "true";
-  article.spellcheck = true;
-  article.setAttribute("aria-label", "Edit note content");
-  article.setAttribute("role", "textbox");
-  article.setAttribute("aria-multiline", "true");
-  article.innerHTML = renderTextDocument(payload.content || "", doc, { includeFallbackTitle: false });
-  if (!Array.from(article.children).some((node) => !node.hidden)) {
-    const emptyParagraph = document.createElement("p");
-    emptyParagraph.append(document.createElement("br"));
-    article.append(emptyParagraph);
-  }
-  const updateEmptyState = () => {
-    const hasVisibleContent = Array.from(article.childNodes).some((node) =>
-      node.nodeType === Node.ELEMENT_NODE
-        ? !node.hidden && (node.tagName !== "P" || Boolean(node.textContent.trim() || node.querySelector("img")))
-        : Boolean(node.nodeValue.trim())
-    );
-    article.dataset.empty = String(!hasVisibleContent);
-  };
-  updateEmptyState();
-  readerContent.append(toolbar, article);
-
-  const originalBlocks = new WeakMap();
-  for (const node of article.children) {
-    if (node.dataset.source === undefined) continue;
-    const prefix = decodeEditorSource(node.dataset.prefix);
-    const raw = decodeEditorSource(node.dataset.source);
-    originalBlocks.set(node, {
-      markup: node.outerHTML,
-      gap: decodeEditorSource(node.dataset.gap),
-      source: prefix ? prefix + "\n" + raw : raw,
-    });
-  }
-  state.editorSession = {
-    path: doc.path,
-    title: doc.title,
-    initialMarkup: article.innerHTML,
-    originalBlocks,
-  };
-
-  let titleHeading = currentTitleHeading(article, doc);
-  const updateStatus = () => {
-    status.textContent = editorHasUnsavedChanges() ? "Unsaved changes" : "";
-  };
-  titleInput.addEventListener("input", () => {
-    titleHeading = currentTitleHeading(article, doc) || titleHeading;
-    if (titleHeading?.isConnected) titleHeading.textContent = titleInput.value;
-    updateStatus();
-  });
-  article.addEventListener("input", () => {
-    const converted = applyLiveBlockSyntax(article, doc.extension, state.editorSession);
-    if (converted && doc.extension === ".md" && article.querySelector("h1") === converted) {
-      titleHeading = converted;
-    }
-    if (doc.extension === ".md" && (!titleHeading || !titleHeading.isConnected)) {
-      titleHeading = article.querySelector("h1");
-    }
-    if (titleHeading?.isConnected) titleInput.value = titleHeading.textContent.trim();
-    updateEmptyState();
-    updateStatus();
-  });
-  article.addEventListener("click", (event) => {
-    const target = event.target instanceof Element ? event.target.closest("a") : null;
-    if (target) event.preventDefault();
-  });
-  article.focus();
+  article.className = "document-article";
+  article.innerHTML = renderTextDocument(payload.content || "", doc);
+  readerContent.append(notice, article);
 }
 
-async function saveNote(doc, payload) {
-  const article = $(".note-inline-editor");
-  const titleInput = $(".reader-title-editor");
-  if (!article || !titleInput || !state.editorSession) return;
-
-  const title = titleInput.value.trim() || "Untitled";
-  const content = serializeEditedNote(article, payload, doc, state.editorSession, title);
-  const saveButtons = readerContent.querySelectorAll(".reader-actions button");
-  saveButtons.forEach((button) => { button.disabled = true; });
-  titleInput.disabled = true;
-  article.contentEditable = "false";
+async function convertLegacyNote(doc) {
   try {
-    const response = await fetch("/api/notes?path=" + encodeURIComponent(doc.path), {
-      method: "PUT",
+    const response = await fetch(`/api/notes/convert?path=${encodeURIComponent(doc.path)}`, {
+      method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title, content, version: payload.version }),
+      body: "{}",
     });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Could not save note.");
-    const updated = { ...doc, ...result };
-    const index = state.documents.findIndex((item) => item.path === doc.path);
-    if (index >= 0) state.documents[index] = updated;
-    state.selected = updated;
-    const updatedPayload = { ...payload, title: updated.title, content, version: updated.version };
-    renderSelectedDocument(updated, updatedPayload);
-    updateList();
-    if (state.query) runSearch(state.query);
-    showToast("Note saved");
+    if (!response.ok) throw new Error(result.error || "Could not convert the note.");
+    if (state.selected?.path !== doc.path) return;
+    renderSelectedDocument(doc, result, { focus: "body" });
   } catch (error) {
     showToast(error.message);
-    saveButtons.forEach((button) => { button.disabled = false; });
-    titleInput.disabled = false;
-    article.contentEditable = "true";
   }
+}
+
+function autoSizeTitle(input) {
+  input.style.height = "auto";
+  input.style.height = `${input.scrollHeight}px`;
+}
+
+// A note's folded sections (the block IDs of their headings), remembered in
+// this browser like Explore's closed sections; folding never changes the note.
+function foldedSections(path) {
+  try {
+    const ids = JSON.parse(localStorage.getItem(`zetesis.note.folded.${path}`) || "[]");
+    return Array.isArray(ids) ? ids.filter((id) => typeof id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberFoldedSections(path, ids) {
+  try {
+    const key = `zetesis.note.folded.${path}`;
+    if (ids.length) localStorage.setItem(key, JSON.stringify(ids));
+    else localStorage.removeItem(key);
+  } catch { /* Remembering it is optional. */ }
+}
+
+function openBlockEditor(doc, payload, statusElement, { focus = "" } = {}) {
+  const page = document.createElement("div");
+  page.className = "note-page";
+  const titleInput = document.createElement("textarea");
+  titleInput.className = "note-title-input";
+  titleInput.rows = 1;
+  titleInput.maxLength = 300;
+  titleInput.placeholder = "Untitled";
+  titleInput.spellcheck = true;
+  titleInput.setAttribute("aria-label", "Note title");
+  const editorElement = document.createElement("div");
+  editorElement.className = "note-editor";
+  page.append(titleInput, editorElement);
+  // The note's headings, beside it (the editor fills it in and shows it).
+  const outline = document.createElement("nav");
+  outline.className = "note-outline";
+  outline.hidden = true;
+  outline.setAttribute("aria-label", "Outline");
+  readerContent.append(outline, page);
+
+  if (!window.ZetesisEditor) {
+    titleInput.value = doc.title;
+    titleInput.readOnly = true;
+    editorElement.textContent = "The editor could not be loaded. Reload the page to try again.";
+    statusElement.textContent = "Read-only";
+    return;
+  }
+
+  // Edits whose background save failed after the note was closed come back here.
+  const draft = state.unsavedDrafts.get(doc.path);
+  const session = {
+    path: doc.path,
+    version: draft ? draft.version : payload.version,
+    titleInput,
+    statusElement,
+    savedTitle: doc.title,
+    savedBody: "",
+    controller: null,
+    timer: null,
+    inFlight: null,
+    queued: false,
+    conflict: false,
+    paused: false,
+    disposed: false,
+    finalSnapshot: null,
+    ready: false,
+  };
+  state.editorSession = session;
+  titleInput.value = draft ? draft.title : doc.title;
+
+  const supported = payload.body_format_version === window.ZetesisEditor.BODY_FORMAT_VERSION;
+  session.controller = window.ZetesisEditor.createNoteEditor({
+    element: editorElement,
+    content: draft ? draft.body : payload.body,
+    scrollContainer: readerContent,
+    editable: supported,
+    onChange: () => {
+      if (session.ready) scheduleNoteSave(session);
+    },
+    onOpenNote: openLinkedNote,
+    onEscape: () => closeNoteViewer(),
+    onNotice: showToast,
+    askText,
+    uploadFile: (file) => uploadAsset(file, doc.path),
+    findNotes: findNotesForLink,
+    listPdfNotes,
+    folded: foldedSections(doc.path),
+    onFoldChange: (ids) => rememberFoldedSections(doc.path, ids),
+    outline,
+  });
+  session.savedBody = draft ? "" : JSON.stringify(session.controller.getJSON());
+  session.ready = true;
+
+  if (!supported || session.controller.contentError) {
+    // Never autosave a document this editor cannot represent faithfully.
+    session.conflict = true;
+    titleInput.readOnly = true;
+    setSaveStatus(session, "readonly", supported
+      ? "This note's content does not match the editor schema, so it was opened read-only to protect it."
+      : "This note was saved by a newer version of Zetesis and is read-only here.");
+  } else if (draft) {
+    scheduleNoteSave(session, 0);
+    showToast("Restored edits that had not been saved yet");
+  } else {
+    setSaveStatus(session, "saved");
+  }
+
+  autoSizeTitle(titleInput);
+  titleInput.addEventListener("input", () => {
+    autoSizeTitle(titleInput);
+    scheduleNoteSave(session);
+  });
+  titleInput.addEventListener("keydown", (event) => {
+    const atEnd = titleInput.selectionStart === titleInput.value.length;
+    if (event.key === "Enter" || (event.key === "ArrowDown" && atEnd)) {
+      event.preventDefault();
+      session.controller.focus("start");
+    }
+  });
+
+  if (focus === "title") {
+    titleInput.focus();
+    titleInput.select();
+  } else if (focus === "body") {
+    session.controller.focus("start");
+  }
+}
+
+function noteSnapshot(session) {
+  if (session.disposed) return session.finalSnapshot;
+  const body = session.controller.getJSON();
+  return {
+    title: session.titleInput.value.trim() || "Untitled",
+    body,
+    bodyText: JSON.stringify(body),
+  };
+}
+
+function noteSessionIsDirty(session) {
+  if (!session?.controller || session.controller.contentError) return false;
+  const snapshot = noteSnapshot(session);
+  return Boolean(snapshot) && (snapshot.bodyText !== session.savedBody || snapshot.title !== session.savedTitle);
+}
+
+const SAVE_STATUS_LABELS = {
+  saved: "Saved",
+  unsaved: "Unsaved changes",
+  saving: "Saving…",
+  error: "Not saved",
+  conflict: "Changed elsewhere",
+  readonly: "Read-only",
+};
+
+function setSaveStatus(session, status, detail = "") {
+  if (session.disposed) return;
+  const element = session.statusElement;
+  element.dataset.state = status;
+  element.title = detail;
+  element.replaceChildren(SAVE_STATUS_LABELS[status] || "");
+  if (status === "error") {
+    element.append(" · ", readerButton("Retry", "save-status-action", () => saveNoteSession(session)));
+  } else if (status === "conflict") {
+    element.append(" · ", readerButton("Reload", "save-status-action", () => reloadConflictedNote(session)));
+  }
+}
+
+function scheduleNoteSave(session, delay = AUTOSAVE_DELAY_MS) {
+  if (session.disposed || session.conflict || session.paused) return;
+  window.clearTimeout(session.timer);
+  if (!session.inFlight) setSaveStatus(session, "unsaved");
+  session.timer = window.setTimeout(() => saveNoteSession(session), delay);
+}
+
+// Saves run one at a time per note, always against the last version this
+// window saw; the server refuses a stale version (409) instead of overwriting.
+async function saveNoteSession(session, { keepalive = false } = {}) {
+  window.clearTimeout(session.timer);
+  session.timer = null;
+  if (session.conflict || session.paused || !session.controller || session.controller.contentError) return false;
+  if (session.inFlight) {
+    session.queued = true;
+    return session.inFlight;
+  }
+  const snapshot = noteSnapshot(session);
+  if (!snapshot || (snapshot.bodyText === session.savedBody && snapshot.title === session.savedTitle)) {
+    setSaveStatus(session, "saved");
+    return true;
+  }
+
+  setSaveStatus(session, "saving");
+  const request = (async () => {
+    const response = await fetch(`/api/notes?path=${encodeURIComponent(session.path)}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      keepalive,
+      body: JSON.stringify({
+        title: snapshot.title,
+        version: session.version,
+        body: snapshot.body,
+        body_format_version: window.ZetesisEditor.BODY_FORMAT_VERSION,
+      }),
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const error = new Error(result.error || `Could not save the note (${response.status}).`);
+      error.conflict = response.status === 409;
+      throw error;
+    }
+    return result;
+  })();
+  session.inFlight = request.then(() => true, () => false);
+  state.pendingSaves.set(session.path, session.inFlight);
+
+  let saved = false;
+  try {
+    const result = await request;
+    saved = true;
+    session.version = result.version;
+    session.savedBody = snapshot.bodyText;
+    session.savedTitle = snapshot.title;
+    state.unsavedDrafts.delete(session.path);
+    applySavedNoteMetadata(result);
+    if (!session.disposed) setSaveStatus(session, noteSessionIsDirty(session) ? "unsaved" : "saved");
+  } catch (error) {
+    session.conflict = Boolean(error.conflict);
+    if (session.disposed) {
+      // The note was closed before this save failed: keep the latest edits
+      // so reopening the note restores them.
+      const latest = session.finalSnapshot || snapshot;
+      state.unsavedDrafts.set(session.path, { title: latest.title, body: latest.body, version: session.version });
+      showToast(`Couldn't save “${latest.title}”: ${error.message} Reopen the note to restore your edits.`);
+    } else {
+      setSaveStatus(session, session.conflict ? "conflict" : "error", error.message);
+    }
+  } finally {
+    const pending = session.inFlight;
+    const queued = session.queued;
+    session.inFlight = null;
+    session.queued = false;
+    if (queued && saved && !session.conflict) {
+      saveNoteSession(session, { keepalive });
+    } else if (state.pendingSaves.get(session.path) === pending) {
+      state.pendingSaves.delete(session.path);
+    }
+  }
+  return saved;
+}
+
+function applySavedNoteMetadata(result) {
+  const previous = state.documents.find((item) => item.path === result.path);
+  const merge = (item) => (item.path === result.path ? { ...item, ...result } : item);
+  state.documents = state.documents.map(merge);
+  state.results = state.results.map(merge);
+  if (state.selected?.path === result.path) state.selected = { ...state.selected, ...result };
+  if (state.selectedPayload && state.selected?.path === result.path) state.selectedPayload.version = result.version;
+  if (previous && previous.title !== result.title) updateList();
+}
+
+async function reloadConflictedNote(session) {
+  const reload = await askConfirm({
+    title: "Load the latest saved version?",
+    message: "Edits in this window that weren't saved will be lost.",
+    confirmLabel: "Load latest",
+    danger: true,
+  });
+  if (!reload || session.disposed) return;
+  const doc = state.documents.find((item) => item.path === session.path);
+  closeEditorSession({ save: false });
+  state.unsavedDrafts.delete(session.path);
+  if (doc) selectDocument(doc);
+}
+
+// Close the open editor. Pending edits are saved in the background unless
+// `save` is false (for example when the note is being deleted).
+function closeEditorSession({ save = true } = {}) {
+  const session = state.editorSession;
+  if (!session) return;
+  state.editorSession = null;
+  window.clearTimeout(session.timer);
+  if (save && noteSessionIsDirty(session) && !session.conflict) {
+    session.finalSnapshot = noteSnapshot(session);
+    session.disposed = true;
+    if (!session.inFlight) saveNoteSession(session);
+    else session.queued = true;
+  } else {
+    session.disposed = true;
+  }
+  session.controller?.destroy();
+}
+
+const UPLOAD_TYPES_BY_EXTENSION = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  avif: "image/avif",
+  svg: "image/svg+xml",
+  pdf: "application/pdf",
+  txt: "text/plain",
+  org: "text/plain",
+  md: "text/markdown",
+  markdown: "text/markdown",
+  csv: "text/csv",
+  json: "application/json",
+  zip: "application/zip",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  mp3: "audio/mpeg",
+  m4a: "audio/mp4",
+  wav: "audio/wav",
+  mp4: "video/mp4",
+  webm: "video/webm",
+  mov: "video/quicktime",
+};
+const UPLOAD_TYPES = new Set(Object.values(UPLOAD_TYPES_BY_EXTENSION));
+
+// The type a file is uploaded as, or null when a note can't hold it.
+function uploadType(file) {
+  const extension = (file.name || "").split(".").pop().toLowerCase();
+  return UPLOAD_TYPES.has(file.type) ? file.type : UPLOAD_TYPES_BY_EXTENSION[extension] || null;
+}
+
+async function uploadAsset(file, notePath) {
+  const type = uploadType(file);
+  if (!type) throw new Error("This type of file can't be added to a note.");
+  if (!file.size) throw new Error("The file is empty.");
+  if (file.size > MAX_UPLOAD_BYTES) throw new Error(`Files can be at most ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB.`);
+  const params = new URLSearchParams({ filename: file.name || "file", note: notePath });
+  const response = await fetch(`/api/assets?${params}`, {
+    method: "POST",
+    headers: { "Content-Type": type },
+    body: file,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "The upload failed.");
+  return result;
+}
+
+function findNotesForLink(query) {
+  const terms = query.toLocaleLowerCase().split(/\s+/).filter(Boolean);
+  return state.documents
+    .filter((doc) => doc.path !== state.selected?.path)
+    .filter((doc) => terms.every((term) => `${doc.title} ${doc.path}`.toLocaleLowerCase().includes(term)))
+    .slice(0, 6)
+    .map((doc) => ({ path: doc.path, title: doc.title, meta: formatFolderPath(doc.folder || doc.collection) }));
+}
+
+function listPdfNotes() {
+  return state.documents
+    .filter((doc) => doc.extension === ".pdf")
+    .map((doc) => ({ path: doc.path, title: doc.title, meta: formatFolderPath(doc.folder || doc.collection) }));
+}
+
+function openLinkedNote(path) {
+  const doc = state.documents.find((item) => item.path === path);
+  if (!doc) {
+    showToast("The linked note no longer exists.");
+    return;
+  }
+  if (doc.path === state.selected?.path) return;
+  history.pushState(null, "", `/?note=${encodeURIComponent(doc.path)}`);
+  revealDocument(doc);
 }
 
 async function moveNoteToFolder(path, folder) {
@@ -3085,42 +3727,22 @@ async function moveNoteToFolder(path, folder) {
     });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Could not move note.");
-    state.documents = state.documents.map((doc) => doc.path === path ? { ...doc, ...result } : doc);
-    state.results = state.results.map((doc) => doc.path === path ? { ...doc, ...result } : doc);
+    const moved = state.documents.find((doc) => doc.path === path);
+    // The server puts a moved note at the top of the list.
+    if (moved) state.documents = [{ ...moved, ...result }, ...state.documents.filter((doc) => doc !== moved)];
+    state.results = state.query ? state.results.map((doc) => doc.path === path ? { ...doc, ...result } : doc) : state.documents;
     if (state.selected?.path === path) {
       state.selected = { ...state.selected, ...result };
       if (state.selectedPayload) state.selectedPayload.version = result.version;
+      // Moving bumps the note version; keep the open editor's saves current.
+      if (state.editorSession?.path === path) state.editorSession.version = result.version;
     }
     state.folder = folder;
     state.expanded.add(folder);
     buildFolderTree(state.documents);
     highlightActiveFolder();
     updateList();
-    showToast(`Moved to ${folder.split("/").map(formatFolderName).join(" / ")}`);
-  } catch (error) {
-    showToast(error.message);
-  }
-}
-
-async function createTopic() {
-  if (!confirmDiscardEditor()) return;
-  const name = window.prompt("Topic name");
-  if (!name?.trim()) return;
-  try {
-    const response = await fetch("/api/topics", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name.trim() }),
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Could not create topic.");
-    if (state.view === "roadmap" || state.view === "projects" || state.view === "following") switchToNotes();
-    state.collections[result.key] = result.label;
-    state.folder = result.key;
-    buildFolderTree(state.documents);
-    highlightActiveFolder();
-    updateList();
-    showToast(`Created topic: ${result.label}`);
+    showToast(`Moved to ${formatFolderPath(folder)}`);
   } catch (error) {
     showToast(error.message);
   }
@@ -3131,6 +3753,7 @@ function openNewNoteDialog() {
   const select = $("#new-note-topic");
   select.replaceChildren();
   for (const [key, label] of Object.entries(state.collections)) {
+    if (key === FOLLOWING_TOPIC) continue;
     const option = document.createElement("option");
     option.value = key;
     option.textContent = label;
@@ -3139,9 +3762,140 @@ function openNewNoteDialog() {
   const currentCollection = state.folder ? state.folder.split("/")[0] : "inbox";
   select.value = state.collections[currentCollection] ? currentCollection : "inbox";
   $("#new-note-title").value = "Untitled";
+  chooseNoteFile(null);
+  showNewNoteError("");
   $("#note-dialog").showModal();
   $("#new-note-title").focus();
   $("#new-note-title").select();
+}
+
+// ── New notes from a file ───────────────────────────────────────────────────
+// A PDF becomes a PDF note; a Markdown, Org or text file, a note with its
+// text; any other file, a note holding it.
+
+const MAX_PDF_NOTE_BYTES = 200 * 1024 * 1024;
+const MAX_TEXT_NOTE_BYTES = 5 * 1024 * 1024;
+const FILE_NOTE_HINTS = {
+  pdf: "Becomes a PDF note you can read and highlight.",
+  text: "Its text becomes the note, ready to edit.",
+  file: "The note will hold the file, to open or download.",
+};
+// The chosen file, and the title it suggested (kept only while untouched).
+const newNoteFile = { file: null, title: "" };
+
+// What a new note makes of `file`: "pdf", "text" or "file". The name usually
+// says; a PDF is also known by its first bytes, as when its name lost ".pdf".
+async function fileNoteKind(file) {
+  const extension = file.name.includes(".") ? file.name.split(".").pop().toLowerCase() : "";
+  if (extension === "pdf") return "pdf";
+  if (["md", "markdown", "org", "txt"].includes(extension)) return "text";
+  const start = await file.slice(0, 5).text().catch(() => "");
+  return start === "%PDF-" ? "pdf" : "file";
+}
+
+// The name a PDF is stored under: "notes" and "notespdf" become "notes.pdf".
+function pdfFileName(name) {
+  if (/\.pdf$/i.test(name)) return name;
+  return `${name.replace(/[\s._-]*pdf$/i, "") || "document"}.pdf`;
+}
+
+// "lecture_notes-week-3.pdf" → "Lecture notes week 3", as the server names imported files.
+function fileTitle(name) {
+  const stem = name.replace(/\.[^.]*$/, "").replace(/[_-]+/g, " ").trim();
+  return stem ? stem[0].toUpperCase() + stem.slice(1) : name;
+}
+
+function fileNoteTitle(file, kind) {
+  return fileTitle(kind === "pdf" ? pdfFileName(file.name) : file.name);
+}
+
+// Why a note can't be made from `file`, or "" when it can.
+function fileNoteProblem(file, kind) {
+  if (!file.size) return "The file is empty.";
+  if (kind === "pdf" && file.size > MAX_PDF_NOTE_BYTES) return `PDFs can be at most ${MAX_PDF_NOTE_BYTES / (1024 * 1024)} MB.`;
+  if (kind === "text" && file.size > MAX_TEXT_NOTE_BYTES) return `Text files can be at most ${MAX_TEXT_NOTE_BYTES / (1024 * 1024)} MB.`;
+  if (kind === "file" && !uploadType(file)) {
+    return "This type of file can't be added to a note. Notes can start from PDFs, Markdown, Org and text files, images, Office documents, audio, and video.";
+  }
+  if (kind === "file" && file.size > MAX_UPLOAD_BYTES) return `Files like this can be at most ${MAX_UPLOAD_BYTES / (1024 * 1024)} MB.`;
+  return "";
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Shows the chosen file (or none) in the New note dialog, with what it will
+// become, or why it can't, before anything is uploaded.
+async function chooseNoteFile(file) {
+  newNoteFile.file = file;
+  const kind = file ? await fileNoteKind(file) : null;
+  if (newNoteFile.file !== file) return;
+  const problem = file ? fileNoteProblem(file, kind) : "";
+  const titleInput = $("#new-note-title");
+  const untouched = !titleInput.value.trim() || titleInput.value === "Untitled" || titleInput.value === newNoteFile.title;
+  if (file) {
+    newNoteFile.title = fileNoteTitle(file, kind);
+    if (untouched) titleInput.value = newNoteFile.title;
+    $("#new-note-file-name").textContent = `${file.name} · ${formatFileSize(file.size)}`;
+    $("#new-note-file-hint").textContent = problem ? "" : FILE_NOTE_HINTS[kind];
+  } else {
+    if (newNoteFile.title && titleInput.value === newNoteFile.title) titleInput.value = "Untitled";
+    newNoteFile.title = "";
+  }
+  const zone = $("#new-note-file-zone");
+  zone.classList.toggle("has-file", Boolean(file));
+  zone.querySelector(".note-file-empty").hidden = Boolean(file);
+  zone.querySelector(".note-file-chosen").hidden = !file;
+  $("#create-note").textContent = file ? "Create from file" : "Create note";
+  showNewNoteError(problem);
+}
+
+function showNewNoteError(message) {
+  $("#new-note-error").textContent = message;
+  $("#new-note-error").hidden = !message;
+}
+
+async function postNote(note) {
+  const response = await fetch("/api/notes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(note),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "Could not create note.");
+  return result;
+}
+
+// PDFs and text files go to the server whole; any other file is uploaded,
+// then put in a new note of its own.
+async function uploadNote(file, { title, collection, folder }) {
+  const kind = await fileNoteKind(file);
+  const problem = fileNoteProblem(file, kind);
+  if (problem) throw new Error(problem);
+  if (kind === "file") {
+    const asset = await uploadAsset(file, "");
+    const block = asset.mimeType.startsWith("image/")
+      ? { type: "image", attrs: { assetId: asset.id, alt: asset.name } }
+      : { type: "fileBlock", attrs: { assetId: asset.id, name: asset.name, mimeType: asset.mimeType, size: asset.size } };
+    return postNote({
+      title, collection, folder,
+      body: { type: "doc", content: [block, { type: "paragraph" }] },
+      body_format_version: window.ZetesisEditor.BODY_FORMAT_VERSION,
+    });
+  }
+  const filename = kind === "pdf" ? pdfFileName(file.name) : file.name;
+  const params = new URLSearchParams({ filename, title, collection, folder });
+  const response = await fetch(`/api/notes/file?${params}`, {
+    method: "POST",
+    headers: { "Content-Type": kind === "pdf" ? "application/pdf" : "text/plain" },
+    body: file,
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || "Could not create the note.");
+  return result;
 }
 
 async function createNoteFromDialog(event) {
@@ -3149,37 +3903,76 @@ async function createNoteFromDialog(event) {
   const title = $("#new-note-title").value.trim() || "Untitled";
   const collection = $("#new-note-topic").value || "inbox";
   const folder = state.folder.startsWith(`${collection}/`) || state.folder === collection ? state.folder : collection;
+  const button = $("#create-note");
+  const label = button.textContent;
+  button.disabled = true;
+  if (newNoteFile.file) button.textContent = "Uploading…";
   try {
-    const response = await fetch("/api/notes", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title, content: "", extension: ".md", collection, folder }),
-    });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.error || "Could not create note.");
-    $("#note-dialog").close();
+    await createNote({ title, collection, folder, file: newNoteFile.file });
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+}
+
+// Pick a file, then make a note from it in `folder` (the folder menu's
+// "New note from a file…").
+function createNoteFromPickedFile(folder) {
+  const picker = document.createElement("input");
+  picker.type = "file";
+  picker.addEventListener("change", async () => {
+    const [file] = picker.files;
+    if (file) createNote({ title: fileNoteTitle(file, await fileNoteKind(file)), collection: pathParts(folder)[0], folder, file });
+  });
+  picker.click();
+}
+
+// Create a note in `folder` (from `file`, if there is one) and open it.
+async function createNote({ title, collection, folder, file = null }) {
+  if (state.view !== "notes" && !switchToNotes({ retry: () => createNote({ title, collection, folder, file }) })) return;
+  try {
+    const result = file ? await uploadNote(file, { title, collection, folder }) : await postNote({ title, collection, folder });
+    if ($("#note-dialog").open) $("#note-dialog").close();
     state.query = "";
     $("#search-input").value = "";
     $("#clear-search").hidden = true;
     state.folder = folder;
+    state.expanded.add(folder);
     state.documents.unshift(result);
     state.results = state.documents;
     buildFolderTree(state.documents);
     highlightActiveFolder();
+    updateHeading();
     updateList();
     selectDocument(result, { edit: true });
   } catch (error) {
-    showToast(error.message);
+    if ($("#note-dialog").open) showNewNoteError(error.message);
+    else showToast(error.message);
   }
 }
 
 async function deleteNote(path) {
-  if (!confirmDiscardEditor()) return;
-  if (!window.confirm("Are you sure you want to delete this note?\n\nThis will delete it permanently and cannot be undone.")) return;
+  const title = state.documents.find((doc) => doc.path === path)?.title;
+  const remove = await askConfirm({
+    title: title ? `Delete “${title}”?` : "Delete this note?",
+    message: "It will be deleted permanently. This can't be undone.",
+    confirmLabel: "Delete",
+    danger: true,
+  });
+  if (!remove) return;
+  // Hold autosave while deleting; the edits are discarded only if the delete succeeds.
+  const session = state.editorSession?.path === path ? state.editorSession : null;
+  if (session) {
+    window.clearTimeout(session.timer);
+    session.paused = true;
+  }
   try {
+    await waitForPendingSave(path);
     const response = await fetch(`/api/notes?path=${encodeURIComponent(path)}`, { method: "DELETE" });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || "Could not delete note.");
+    rememberFoldedSections(path, []);
+    if (session) closeEditorSession({ save: false });
     state.documents = state.documents.filter((doc) => doc.path !== path);
     state.results = state.results.filter((doc) => doc.path !== path);
     state.requestId += 1;
@@ -3189,6 +3982,10 @@ async function deleteNote(path) {
     updateList();
     showToast(result.warning || "Note deleted permanently");
   } catch (error) {
+    if (session && !session.disposed) {
+      session.paused = false;
+      if (noteSessionIsDirty(session)) scheduleNoteSave(session);
+    }
     showToast(error.message);
   }
 }
@@ -3198,7 +3995,8 @@ async function openRoadmapEditor() {}
 async function saveRoadmapEditor(event) { event.preventDefault(); }
 
 function selectDocument(doc, { edit = false } = {}) {
-  if (editorHasUnsavedChanges() && !confirmDiscardEditor()) return;
+  if (!confirmDiscardEditor(() => selectDocument(doc, { edit }))) return;
+  closeEditorSession();
   disposePdfViewer();
   state.selected = doc;
   if (!noteViewer.open) noteViewer.showModal();
@@ -3211,25 +4009,27 @@ function selectDocument(doc, { edit = false } = {}) {
 
   readerContent.hidden = false;
   readerContent.style.display = "block";
+  // The note has the focus, not the dialog's first button (←), so keys scroll it.
+  readerContent.focus({ preventScroll: true });
   readerContent.innerHTML = '<div class="document-article">Loading note…</div>';
 
   const requestId = ++state.documentRequestId;
   if (doc.extension === ".pdf") {
     renderSelectedDocument(doc, { content: "", version: doc.version });
-    history.replaceState(null, "", `/?note=${encodeURIComponent(doc.path)}`);
+    history.replaceState(null, "", noteUrl(doc.path));
     return;
   }
 
-  fetch(`/api/document?path=${encodeURIComponent(doc.path)}`)
+  waitForPendingSave(doc.path)
+    .then(() => fetch(`/api/document?path=${encodeURIComponent(doc.path)}`))
     .then((res) => {
       if (!res.ok) throw new Error("Could not load note content.");
       return res.json();
     })
     .then((payload) => {
       if (requestId !== state.documentRequestId || state.selected?.path !== doc.path) return;
-      if (edit) startEditingNote(doc, payload);
-      else renderSelectedDocument(doc, payload);
-      history.replaceState(null, "", `/?note=${encodeURIComponent(doc.path)}`);
+      renderSelectedDocument(doc, payload, { focus: edit ? "title" : "" });
+      history.replaceState(null, "", noteUrl(doc.path));
     })
     .catch((err) => {
       const article = readerContent.querySelector(".document-article");
@@ -3237,15 +4037,96 @@ function selectDocument(doc, { edit = false } = {}) {
     });
 }
 
-function showToast(message) {
+// A note's background save must finish before it is loaded again.
+async function waitForPendingSave(path) {
+  while (state.pendingSaves.has(path)) await state.pendingSaves.get(path);
+}
+
+// ── Questions, asked in the app ─────────────────────────────────────────────
+// In place of the browser's confirm() and prompt(), which can't be styled.
+// ask() resolves with true, or with the text typed when there's an `input`;
+// null when cancelled (Escape, Cancel, or a click outside).
+
+const askDialog = $("#ask-dialog");
+const askInput = $("#ask-input");
+let askAnswer = null;
+
+function finishAsking(confirmed) {
+  const answer = askAnswer;
+  askAnswer = null;
+  if (askDialog.open) askDialog.close();
+  answer?.(confirmed);
+}
+
+function ask({ title, message = "", confirmLabel = "OK", danger = false, input = null }) {
+  if (askAnswer) finishAsking(false);
+  $("#ask-title").textContent = title;
+  $("#ask-message").textContent = message;
+  $("#ask-message").hidden = !message;
+  askInput.hidden = !input;
+  if (input) {
+    askInput.value = input.value ?? "";
+    askInput.placeholder = input.placeholder ?? "";
+    askInput.setAttribute("aria-label", title);
+  }
+  const confirm = $("#ask-confirm");
+  confirm.textContent = confirmLabel;
+  confirm.classList.toggle("is-danger", danger);
+  askDialog.showModal();
+  if (input) askInput.select();
+  // Enter shouldn't do something that can't be undone.
+  else (danger ? $("#ask-cancel") : confirm).focus();
+  return new Promise((resolve) => {
+    askAnswer = (confirmed) => resolve(confirmed ? (input ? askInput.value : true) : null);
+  });
+}
+
+const askConfirm = (question) => ask(question).then((answer) => answer === true);
+const askText = ({ value, placeholder, ...question }) => ask({ ...question, input: { value, placeholder } });
+
+$("#ask-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  finishAsking(true);
+});
+$("#ask-cancel").addEventListener("click", () => finishAsking(false));
+askDialog.addEventListener("cancel", (event) => {
+  event.preventDefault();
+  finishAsking(false);
+});
+askDialog.addEventListener("click", (event) => {
+  if (event.target === askDialog) finishAsking(false);
+});
+// The browser may close the dialog on Escape without asking twice.
+askDialog.addEventListener("close", () => {
+  if (askAnswer && !askDialog.open) finishAsking(false);
+});
+
+function showToast(message, { action = "", onAction = null } = {}) {
   const toast = $("#toast");
-  toast.textContent = message;
+  const text = document.createElement("span");
+  text.textContent = message;
+  toast.replaceChildren(text);
+  if (action) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = action;
+    button.addEventListener("click", () => {
+      toast.classList.remove("visible");
+      onAction();
+    });
+    toast.append(button);
+  }
   toast.classList.add("visible");
   window.clearTimeout(showToast.timer);
-  showToast.timer = window.setTimeout(() => toast.classList.remove("visible"), 2200);
+  showToast.timer = window.setTimeout(() => toast.classList.remove("visible"), action ? 6000 : 2200);
 }
 
 async function runSearch(query) {
+  if (state.view === "map") {
+    $("#clear-search").hidden = !query;
+    renderMap();
+    return;
+  }
   if (state.view === "home") {
     renderHomeSuggestions(query);
     $("#clear-search").hidden = !state.query;
@@ -3271,7 +4152,7 @@ async function runSearch(query) {
 }
 
 function selectAllNotes() {
-  if (!switchToNotes()) return;
+  if (!switchToNotes({ retry: selectAllNotes })) return;
   state.folder = "";
   highlightActiveFolder();
   updateHeading();
@@ -3280,9 +4161,8 @@ function selectAllNotes() {
 }
 
 function formatFolderPath(path) {
-  return pathParts(path).map((part, index) =>
-    index === 0 && state.collections[part] ? state.collections[part] : formatFolderName(part)
-  ).join(" / ");
+  const parts = pathParts(path);
+  return parts.map((_, index) => folderLabel(parts.slice(0, index + 1).join("/"))).join(" / ");
 }
 
 function getHomeFolders() {
@@ -3291,33 +4171,38 @@ function getHomeFolders() {
     if (path && !folders.has(path)) folders.set(path, { path, label });
   };
 
-  for (const [key, label] of Object.entries(state.collections)) addFolder(key, label || formatFolderName(key));
+  for (const key of Object.keys(state.collections)) if (key !== FOLLOWING_TOPIC) addFolder(key, folderLabel(key));
+  for (const folder of state.folders) addFolder(folder.path, folder.label);
   for (const doc of state.documents) {
     const collection = doc.collection || "general";
-    addFolder(collection, state.collections[collection] || formatFolderName(collection));
+    if (collection === FOLLOWING_TOPIC) continue;
+    addFolder(collection, folderLabel(collection));
     let currentPath = collection;
     let parts = pathParts(doc.folder);
     if (parts[0] === collection) parts = parts.slice(1);
     else if (collection === "general") parts = [];
     for (const part of parts) {
       currentPath = `${currentPath}/${part}`;
-      addFolder(currentPath, formatFolderName(part));
+      addFolder(currentPath, folderLabel(currentPath));
     }
   }
   return [...folders.values()];
 }
 
-function renderHomeResult({ kind, title, meta = "", doc = null, folderPath = "" }) {
+// A folder or note result, or with `key` and `open`, another kind of place
+// (Explore and its areas and items, Following).
+function renderHomeResult({ kind, title, meta = "", doc = null, folderPath = "", key = "", open = null }) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "home-result";
+  button.dataset.key = key || (kind === "folder" ? `folder:${folderPath}` : `note:${doc.path}`);
   const symbol = document.createElement("span");
   symbol.className = "home-result-symbol";
-  if (kind === "folder") {
-    symbol.innerHTML = folderSvg;
-  } else {
+  if (kind === "note") {
     symbol.classList.add("file-badge", ...(doc.extension === ".pdf" ? ["pdf"] : []));
     symbol.textContent = doc.extension.slice(1).toUpperCase();
+  } else {
+    symbol.innerHTML = HOME_RESULT_ICONS[kind];
   }
 
   const copy = document.createElement("span");
@@ -3333,7 +4218,8 @@ function renderHomeResult({ kind, title, meta = "", doc = null, folderPath = "" 
     copy.append(metaEl);
   }
   button.append(symbol, copy);
-  if (kind === "folder") button.addEventListener("click", () => openHomeFolder(folderPath));
+  if (open) button.addEventListener("click", () => open());
+  else if (kind === "folder") button.addEventListener("click", () => openHomeFolder(folderPath));
   else button.addEventListener("click", () => openHomeNote(doc));
   return button;
 }
@@ -3350,7 +4236,11 @@ function appendHomeSuggestionGroup(label, results) {
   homeSuggestions.append(group);
 }
 
-function renderHomeSuggestions(query) {
+let homeExploreLoad = null;
+
+// `keepSelection` keeps the selected result when the results are redrawn
+// for the same query (once Explore has loaded).
+function renderHomeSuggestions(query, { keepSelection = false } = {}) {
   state.query = query.trim();
   homeSuggestions.replaceChildren();
   const normalized = state.query.toLocaleLowerCase();
@@ -3379,8 +4269,30 @@ function renderHomeSuggestions(query) {
       folderPath: folder.path,
     }));
 
+  // Explore, Roadmap and Following by their names (or the Following note's
+  // title), from the start of the name, so that "in" finds the Inbox before
+  // Following.
+  const named = (name) => name.toLocaleLowerCase().startsWith(normalized);
+  const followingNote = state.documents.find((doc) => doc.collection === FOLLOWING_TOPIC);
+  const pages = [];
+  if (named("Explore")) {
+    pages.push(renderHomeResult({ kind: "explore", title: "Explore", key: "section:explore", open: () => openExploreResult() }));
+  }
+  if (named("Roadmap")) {
+    pages.push(renderHomeResult({ kind: "map", title: "Roadmap", key: "section:map", open: () => switchToMap() }));
+  }
+  if (named("Following") || (followingNote && named(followingNote.title))) {
+    pages.push(renderHomeResult({
+      kind: "following",
+      title: "Following",
+      meta: followingNote && followingNote.title !== "Following" ? followingNote.title : "",
+      key: "section:following",
+      open: openFollowingNote,
+    }));
+  }
+
   const notes = state.documents
-    .filter((doc) => matches(`${doc.title} ${doc.path}`))
+    .filter((doc) => doc.collection !== FOLLOWING_TOPIC && matches(`${doc.title} ${doc.path}`))
     .sort((a, b) => rank(a.title, a.path) - rank(b.title, b.path) || a.title.localeCompare(b.title))
     .slice(0, 12)
     .map((doc) => renderHomeResult({
@@ -3390,18 +4302,85 @@ function renderHomeSuggestions(query) {
       doc,
     }));
 
+  // Explore's areas and sections, then its items (open ones first), by what they read.
+  if (!state.roadmap && !homeExploreLoad) {
+    homeExploreLoad = loadRoadmap()
+      .then(() => {
+        if (state.view === "home" && state.query) renderHomeSuggestions(searchInput.value, { keepSelection: true });
+      })
+      .catch(() => {})
+      .finally(() => {
+        homeExploreLoad = null;
+      });
+  }
+  const lists = exploreAreas().flatMap((area, index) => exploreLists(area, [index]));
+  const exploreResults = lists
+    .filter(({ list, place }) => matches(place.length === 1 ? `${list.name} Explore` : list.name))
+    .sort((a, b) => a.place.length - b.place.length || rank(a.list.name, "") - rank(b.list.name, ""))
+    .slice(0, 6)
+    .map(({ list, place }) => renderHomeResult({
+      kind: "area",
+      title: list.name,
+      meta: ["Explore", ...exploreTrail(place.slice(0, -1))].join(" / "),
+      key: place.length === 1 ? `area:${list.name}` : `section:${place.join(".")}`,
+      open: () => openExploreResult(place),
+    }));
+  const items = lists
+    .flatMap(({ list, place }) => list.items.map((item, index) => ({ place, item, index, text: plainTitle(item.title) })))
+    .filter(({ text }) => matches(text))
+    .sort((a, b) => a.item.done - b.item.done || rank(a.text, "") - rank(b.text, ""))
+    .slice(0, 8)
+    .map(({ place, item, index, text }) => renderHomeResult({
+      kind: item.done ? "done" : "item",
+      title: text,
+      meta: `Explore / ${exploreTrail(place).join(" / ")}${item.done ? " · done" : ""}`,
+      key: `item:${place.join(".")}:${index}`,
+      open: () => openExploreResult(place, index),
+    }));
+
+  appendHomeSuggestionGroup("Pages", pages);
   appendHomeSuggestionGroup("Topics", folders);
   appendHomeSuggestionGroup("Notes", notes);
-  if (!folders.length && !notes.length) {
+  appendHomeSuggestionGroup("Explore", [...exploreResults, ...items]);
+  const found = pages.length + folders.length + notes.length + exploreResults.length + items.length;
+  if (keepSelection && nav.position >= 0) showNav();
+  else setNav(found ? 0 : -1);
+  if (!found) {
     const empty = document.createElement("div");
     empty.className = "home-empty";
-    empty.textContent = "No matching topics or notes.";
+    empty.textContent = "No matches.";
     homeSuggestions.append(empty);
   }
 }
 
+// Open Explore from a search result at `place`: the list of areas, an area, a
+// section in one (open, with its heading selected), or an item, selected.
+async function openExploreResult(place = [], itemIndex = -1) {
+  const areaName = place.length ? exploreAreas()[place[0]]?.name ?? "" : "";
+  for (let depth = 2; depth <= place.length; depth += 1) setSectionOpen(place.slice(0, depth), true);
+  await switchToRoadmap({ topic: areaName, syncUrl: false });
+  if (state.view !== "roadmap" || state.roadmapTopic !== areaName) return;
+  const params = new URLSearchParams({ view: "roadmap" });
+  if (areaName) params.set("topic", areaName);
+  history.pushState(null, "", `/?${params}`);
+  let key = place.length > 1 ? `section:${place.join(".")}` : "";
+  if (itemIndex >= 0) {
+    key = `item:${place.join(".")}:${itemIndex}`;
+    const doneKey = exploreTrail(place).join("/");
+    if (exploreNode(exploreAreas(), place)?.items[itemIndex]?.done && !exploreDoneOpen(doneKey)) {
+      setExploreDoneOpen(doneKey, true);
+      renderRoadmap();
+    }
+  }
+  const position = key ? navRows().findIndex((row) => rowKey(row) === key) : -1;
+  if (position < 0) return;
+  document.activeElement?.blur?.();
+  document.body.classList.add("keyboard-nav");
+  setNav(position, key);
+}
+
 function openHomeFolder(folderPath, { syncUrl = true } = {}) {
-  if (!switchToNotes()) return;
+  if (!switchToNotes({ retry: () => openHomeFolder(folderPath, { syncUrl }) })) return;
   state.folder = folderPath;
   state.query = "";
   $("#search-input").value = "";
@@ -3418,7 +4397,7 @@ function openHomeFolder(folderPath, { syncUrl = true } = {}) {
 }
 
 function openHomeNote(doc) {
-  if (!switchToNotes()) return;
+  if (!switchToNotes({ retry: () => openHomeNote(doc) })) return;
   state.query = "";
   $("#search-input").value = "";
   $("#clear-search").hidden = true;
@@ -3436,7 +4415,7 @@ function openHomeNote(doc) {
 }
 
 function revealDocument(doc) {
-  if (!switchToNotes()) return;
+  if (!switchToNotes({ retry: () => revealDocument(doc) })) return;
   state.folder = doc.folder || doc.collection;
   state.expanded.add(doc.collection);
   const parts = pathParts(doc.folder);
@@ -3460,18 +4439,19 @@ function applyDeepLink() {
   const doc = state.documents.find((d) => d.path === targetPath);
   if (!doc) return;
 
-  revealDocument(doc);
+  if (doc.collection === FOLLOWING_TOPIC) {
+    switchToHome({ syncUrl: false, focus: false });
+    selectDocument(doc);
+  } else {
+    revealDocument(doc);
+  }
 }
 
 async function initialize() {
   try {
     const res = await fetch("/api/catalog");
     if (!res.ok) throw new Error("Could not load notes catalog.");
-    const payload = await res.json();
-
-    state.documents = payload.documents;
-    state.collections = payload.collections || {};
-    state.results = payload.documents;
+    applyCatalog(await res.json());
 
     // Auto-expand top-level collections
     for (const key of Object.keys(state.collections)) {
@@ -3481,13 +4461,16 @@ async function initialize() {
     buildFolderTree(state.documents);
 
     const params = new URLSearchParams(location.search);
+    // For Explore's count in the sidebar, and its areas and items in search.
+    if (params.get("view") !== "roadmap") loadRoadmap().catch(() => {});
     if (params.get("view") === "roadmap") {
       await switchToRoadmap({ topic: params.get("topic") || "", syncUrl: false });
-      loadProjects().catch(() => {});
-    } else if (params.get("view") === "projects") {
-      await switchToProjects({ syncUrl: false });
+    } else if (params.get("view") === "map") {
+      switchToMap({ syncUrl: false });
     } else if (params.get("view") === "following") {
-      await switchToFollowing({ syncUrl: false });
+      // Following used to be its own page; its note opens instead.
+      switchToHome({ syncUrl: true, focus: false });
+      openFollowingNote();
     } else {
       if (params.get("view") === "trash") history.replaceState(null, "", "/");
       if (params.has("note")) {
@@ -3510,77 +4493,82 @@ async function initialize() {
 }
 
 // Event Listeners
-$("#brand-home").addEventListener("click", (event) => {
-  event.preventDefault();
-  switchToHome();
-});
 navSearch.addEventListener("click", () => switchToHome());
-$("#close-note-viewer").addEventListener("click", closeNoteViewer);
-$("#fullscreen-note-viewer").addEventListener("click", toggleNoteViewerFullscreen);
+$("#close-note-viewer").addEventListener("click", () => closeNoteViewer());
+
+// The outline beside a note can be put away, for every note; that's remembered.
+function showOutline(shown) {
+  noteViewer.classList.toggle("outline-off", !shown);
+  const button = $("#outline-toggle");
+  button.title = shown ? "Hide the outline" : "Show the outline";
+  button.setAttribute("aria-label", button.title);
+  button.setAttribute("aria-pressed", String(shown));
+}
+try {
+  showOutline(localStorage.getItem("zetesis.outline.hidden") !== "1");
+} catch {
+  showOutline(true);
+}
+$("#outline-toggle").addEventListener("click", () => {
+  const shown = noteViewer.classList.contains("outline-off");
+  showOutline(shown);
+  try {
+    if (shown) localStorage.removeItem("zetesis.outline.hidden");
+    else localStorage.setItem("zetesis.outline.hidden", "1");
+  } catch { /* Remembering it is optional. */ }
+});
+// Escape closes the note (asking first if that would lose anything).
 noteViewer.addEventListener("cancel", (event) => {
   event.preventDefault();
-  if (noteViewer.classList.contains("is-fullscreen")) {
-    toggleNoteViewerFullscreen();
-    return;
-  }
   closeNoteViewer();
 });
-noteViewer.addEventListener("click", (event) => {
-  if (event.target === noteViewer) closeNoteViewer();
-});
 navRoadmap.addEventListener("click", () => switchToRoadmap({ topic: "" }));
-navProjects.addEventListener("click", () => switchToProjects());
-navFollowing.addEventListener("click", () => switchToFollowing());
-$("#following-filters").addEventListener("click", (event) => {
-  const button = event.target.closest(".following-filter");
-  if (!button) return;
-  state.followingFilter = button.dataset.kind || "all";
-  renderFollowing();
-});
-$("#new-following-item").addEventListener("click", () => openFollowingDialog());
-$("#following-form").addEventListener("submit", saveFollowingItem);
-$("#cancel-following-item").addEventListener("click", () => $("#following-dialog").close());
-$("#delete-following-item").addEventListener("click", () => {
-  const item = state.following?.find((entry) => entry.id === $("#following-id").value);
-  if (item) deleteFollowingItem(item);
-});
+navMap.addEventListener("click", () => switchToMap());
+navFollowing.addEventListener("click", openFollowingNote);
 $("#new-note").addEventListener("click", openNewNoteDialog);
-$("#new-topic").addEventListener("click", createTopic);
+$("#new-topic").addEventListener("click", () => startNewFolder(""));
 $("#note-form").addEventListener("submit", createNoteFromDialog);
-$("#cancel-new-note").addEventListener("click", () => $("#note-dialog").close());
-$("#new-project").addEventListener("click", () => openProjectDialog());
-$("#project-form").addEventListener("submit", handleProjectFormSubmit);
-$("#cancel-project").addEventListener("click", () => $("#project-dialog").close());
-$("#delete-project").addEventListener("click", deleteProjectFromDialog);
-$("#projects-filters").addEventListener("click", (event) => {
-  const button = event.target.closest(".project-filter");
-  if (!button) return;
-  state.projectFilter = button.dataset.status || "all";
-  renderProjects();
+$("#choose-note-file").addEventListener("click", () => $("#new-note-file").click());
+$("#new-note-file").addEventListener("change", (event) => {
+  const [file] = event.target.files;
+  event.target.value = "";
+  if (file) chooseNoteFile(file);
 });
-// Up Next inline-edit listeners
-$("#add-upnext-item").addEventListener("click", () => openUpNextItemDialog(null, state.roadmapTopic || "", -1, -1));
-$("#upnext-item-form").addEventListener("submit", handleUpNextItemSubmit);
-$("#upnext-item-topic").addEventListener("input", (event) => populateUpNextDatalists(event.currentTarget.value));
-$("#cancel-upnext-item").addEventListener("click", () => $("#upnext-item-dialog").close());
+$("#remove-note-file").addEventListener("click", () => chooseNoteFile(null));
+// A file dropped anywhere on the new-note dialog is the one to start from.
+$("#note-dialog").addEventListener("dragover", (event) => {
+  if (!event.dataTransfer.types.includes("Files")) return;
+  event.preventDefault();
+  $("#new-note-file-zone").classList.add("is-dropping");
+});
+$("#note-dialog").addEventListener("dragleave", (event) => {
+  if (!$("#note-dialog").contains(event.relatedTarget)) $("#new-note-file-zone").classList.remove("is-dropping");
+});
+$("#note-dialog").addEventListener("drop", (event) => {
+  const [file] = event.dataTransfer.files;
+  if (!file) return;
+  event.preventDefault();
+  $("#new-note-file-zone").classList.remove("is-dropping");
+  chooseNoteFile(file);
+});
+$("#cancel-new-note").addEventListener("click", () => $("#note-dialog").close());
+$("#help-button").addEventListener("click", () => {
+  helpOverlay.hidden = false;
+});
 $("#backup-button").addEventListener("click", () => {
   window.location.assign("/api/backup");
   showToast("Preparing a database and files backup…");
 });
 
-roadmapPills.addEventListener("click", (event) => {
-  const pill = event.target.closest(".pill");
-  if (!pill) return;
-  state.roadmapFilter = pill.dataset.type || "all";
-  for (const candidate of roadmapPills.querySelectorAll(".pill")) {
-    candidate.classList.toggle("active", candidate === pill);
-  }
-  renderRoadmap();
-});
-
 $("#search-input").addEventListener("input", (e) => {
   window.clearTimeout(state.searchTimer);
+  // Out of sight (in Explore), the box isn't searching anything.
+  if (searchBar.hidden) return;
   const q = e.target.value;
+  if (state.view === "map") {
+    runSearch(q);
+    return;
+  }
   if (state.view === "home") {
     runSearch(q);
     return;
@@ -3588,22 +4576,6 @@ $("#search-input").addEventListener("input", (e) => {
   state.searchTimer = window.setTimeout(() => runSearch(q), q.trim() ? 150 : 0);
 });
 
-$("#search-input").addEventListener("keydown", (event) => {
-  if (state.view !== "home") return;
-  if (event.key === "ArrowDown") {
-    const firstResult = homeSuggestions.querySelector(".home-result");
-    if (firstResult) {
-      event.preventDefault();
-      firstResult.focus();
-    }
-  } else if (event.key === "Enter") {
-    const firstResult = homeSuggestions.querySelector(".home-result");
-    if (firstResult) {
-      event.preventDefault();
-      firstResult.click();
-    }
-  }
-});
 
 $("#clear-search").addEventListener("click", () => {
   $("#search-input").value = "";
@@ -3617,10 +4589,7 @@ $("#refresh-button").addEventListener("click", async () => {
   try {
     const res = await fetch("/api/catalog", { cache: "no-store" });
     if (!res.ok) throw new Error("Refresh failed.");
-    const payload = await res.json();
-    state.documents = payload.documents;
-    state.collections = payload.collections || {};
-    state.results = state.query ? state.results : payload.documents;
+    applyCatalog(await res.json());
 
     buildFolderTree(state.documents);
     highlightActiveFolder();
@@ -3632,18 +4601,12 @@ $("#refresh-button").addEventListener("click", async () => {
     }
 
     state.roadmap = null;
-    if (state.view === "following") {
-      await loadFollowing({ force: true });
-      renderFollowing();
-    } else if (state.view === "roadmap") {
+    if (state.view === "roadmap") {
       await switchToRoadmap({ topic: state.roadmapTopic });
-    } else if (state.view === "projects") {
-      await loadProjects({ force: true });
-      renderProjects();
     } else {
       loadRoadmap().catch(() => {});
-      loadProjects({ force: true }).catch(() => {});
     }
+    if (state.view === "map") await loadMap();
 
     showToast("App data refreshed");
   } catch (err) {
@@ -3653,28 +4616,79 @@ $("#refresh-button").addEventListener("click", async () => {
   }
 });
 
-document.addEventListener("keydown", (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && $(".note-inline-editor")) {
-    e.preventDefault();
-    const doc = state.selected;
-    const payload = state.selectedPayload;
-    if (doc && payload) {
-      saveNote(doc, payload);
-    }
-  }
-  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-    e.preventDefault();
-    if (noteViewer.open && !closeNoteViewer()) return;
-    if (state.view === "roadmap" || state.view === "projects" || state.view === "following") {
-      if (!switchToNotes()) return;
-    }
+// ⌘L and ⌘K: close the note in the way, then search.
+function startSearch(searchFolder) {
+  if (noteViewer.open && !closeNoteViewer({ retry: () => startSearch(searchFolder) })) return;
+  if (searchFolder && state.view === "map") {
+    openMapFind();
+  } else if (state.view === "home" || (searchFolder && state.view === "notes")) {
     $("#search-input").focus();
+    $("#search-input").select();
+  } else {
+    switchToHome();
   }
-  if (e.key === "Escape" && document.activeElement === $("#search-input")) {
-    $("#search-input").value = "";
-    runSearch("");
-    if (state.view !== "home") $("#search-input").blur();
+}
+
+document.addEventListener("keydown", (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s" && state.editorSession) {
+    e.preventDefault();
+    saveNoteSession(state.editorSession);
   }
+  // ⌘F searches the folder on screen; in an open note it's left to the
+  // browser's find, which searches only the note (the page behind it is
+  // inert). ⌘L and ⌘K search everything. Inside a note, ⌘K with selected
+  // text edits a link (the editor handles it). ⌃F stays forward-a-character
+  // in text.
+  const key = e.key.toLowerCase();
+  const command = e.metaKey && !e.shiftKey && !e.altKey;
+  const searchFolder = key === "f" && command && !noteViewer.open;
+  const searchEverything = (key === "l" && command) || (key === "k" && (e.metaKey || e.ctrlKey));
+  if ((searchFolder || searchEverything) && !e.defaultPrevented) {
+    e.preventDefault();
+    startSearch(searchFolder);
+  }
+  // Escape clears the search; with nothing to clear, it goes up a level. In
+  // Roadmap, it puts the find box away.
+  if (e.key === "Escape" && !e.isComposing && document.activeElement === searchInput) {
+    if (state.view === "map") {
+      closeMapFind();
+    } else if (searchInput.value) {
+      searchInput.value = "";
+      runSearch("");
+      if (state.view !== "home") searchInput.blur();
+    } else if (state.view !== "home") {
+      searchInput.blur();
+      goUp();
+    }
+  }
+});
+
+window.addEventListener("beforeunload", (event) => {
+  const session = state.editorSession;
+  if (!session || !(noteSessionIsDirty(session) || session.inFlight)) return;
+  // Try to save on the way out (keepalive requests are limited to 64 KB),
+  // and ask the browser to confirm leaving.
+  if (!session.inFlight && noteSnapshot(session).bodyText.length < 60000) saveNoteSession(session, { keepalive: true });
+  event.preventDefault();
+  event.returnValue = "";
+});
+
+// When launchd starts the server on demand (server.py --install-launch-agent),
+// it stops shortly after the last open window stops checking in.
+const PRESENCE_ID = crypto.randomUUID();
+const PRESENCE_INTERVAL_MS = 60_000;
+
+function reportPresence(closed = false) {
+  const url = `/api/presence?client=${PRESENCE_ID}${closed ? "&closed=1" : ""}`;
+  if (closed) navigator.sendBeacon(url);
+  else fetch(url, { method: "POST", keepalive: true }).catch(() => {});
+}
+
+reportPresence();
+window.setInterval(() => reportPresence(), PRESENCE_INTERVAL_MS);
+window.addEventListener("pagehide", () => reportPresence(true));
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) reportPresence();
 });
 
 window.addEventListener("popstate", () => {
@@ -3686,18 +4700,15 @@ window.addEventListener("popstate", () => {
     switchToRoadmap({ topic, syncUrl: false });
     return;
   }
-  if (params.get("view") === "projects") {
-    switchToProjects({ syncUrl: false });
-    return;
-  }
-  if (params.get("view") === "following") {
-    switchToFollowing({ syncUrl: false });
+  if (params.get("view") === "map") {
+    switchToMap({ syncUrl: false });
     return;
   }
   const targetPath = params.get("note");
   const doc = state.documents.find((d) => d.path === targetPath);
   if (targetPath && doc) {
-    revealDocument(doc);
+    if (doc.collection === FOLLOWING_TOPIC) selectDocument(doc);
+    else revealDocument(doc);
     return;
   }
   if (params.has("folder")) {
@@ -3706,5 +4717,51 @@ window.addEventListener("popstate", () => {
   }
   switchToHome({ syncUrl: false, focus: false });
 });
+
+// The back and forward buttons on a mouse go back and forward through notes and folders. A browser
+// would do that on letting go of the button, and Zetesis's Mac app would not, so the page does it itself.
+window.addEventListener("mouseup", (event) => {
+  const step = { 3: -1, 4: 1 }[event.button];
+  if (!step) return;
+  event.preventDefault();
+  history.go(step);
+});
+
+// Zetesis's Mac app runs these from its menu bar; each does what its key or button does here. In an
+// open note, "find" is left to the app's find bar, as ⌘F there is left to a browser's.
+const MENU_COMMANDS = {
+  search: () => startSearch(false),
+  find: () => (noteViewer.open ? "page" : startSearch(true)),
+  explore: () => switchToRoadmap({ topic: "" }),
+  roadmap: () => switchToMap(),
+  following: () => openFollowingNote(),
+  newNote: () => openNewNoteDialog(),
+  save: () => state.editorSession && saveNoteSession(state.editorSession),
+  backup: () => $("#backup-button").click(),
+  shortcuts: () => { helpOverlay.hidden = false; },
+};
+
+function menuCommand(name) {
+  return MENU_COMMANDS[name]?.();
+}
+
+// Before quitting or reloading, Zetesis's Mac app has the open note saved now, and shows what would
+// still be lost, if anything; a browser asks before leaving instead. A save that hangs counts as lost.
+async function prepareToLeave() {
+  const session = state.editorSession;
+  if (!session) return "";
+  const title = noteSnapshot(session)?.title || "the open note";
+  const saved = (async () => {
+    if (session.inFlight) await session.inFlight;
+    if (noteSessionIsDirty(session)) await saveNoteSession(session);
+    if (session.inFlight) await session.inFlight;
+    if (session.controller?.hasPendingUploads()) return "A file is still uploading into the open note, and the upload will be lost.";
+    return noteSessionIsDirty(session) ? `Your latest changes to “${title}” couldn't be saved.` : "";
+  })();
+  const late = new Promise((resolve) => {
+    window.setTimeout(() => resolve(`Your latest changes to “${title}” are still saving.`), 5000);
+  });
+  return Promise.race([saved, late]);
+}
 
 initialize();

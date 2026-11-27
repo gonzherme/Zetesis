@@ -3,58 +3,46 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#f6f5f1">
+    <meta name="theme-color" content="#f6f5f1" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#161816" media="(prefers-color-scheme: dark)">
     <title>Zetesis — notes & inquiry</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+    <link rel="manifest" href="/static/manifest.webmanifest">
     <link rel="stylesheet" href="/static/styles.css">
+    <script src="/static/editor/zetesis-editor.js" defer></script>
+    <!-- Before app.js, so Roadmap's map is there when app.js opens it. -->
+    <script src="/static/map.js" defer></script>
     <script src="/static/app.js" defer></script>
   </head>
   <body class="home-mode">
-    <header class="topbar">
-      <a class="brand" id="brand-home" href="/" aria-label="Zetesis home">
-        <span class="brand-mark" aria-hidden="true">ζ</span>
-        <span class="brand-name">zetesis</span>
-      </a>
-      <div class="topbar-right">
-        <button class="secondary-button" id="backup-button" type="button" title="Download a copy of your notes database">Export backup</button>
-        <button class="icon-button refresh-button" id="refresh-button" type="button" title="Refresh app data" aria-label="Refresh app data">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 7v5h-5M4.8 9a7.5 7.5 0 0 1 12.7-2.2L20 12M4 17v-5h5m10.2 3a7.5 7.5 0 0 1-12.7 2.2L4 12"/></svg>
-        </button>
-      </div>
-    </header>
-
     <div class="app-shell home-mode">
       <aside class="sidebar" aria-label="Note topics">
         <div class="sidebar-scroll">
-          <div class="sidebar-primary-nav">
-            <button class="nav-row search-nav-row active" id="nav-search" type="button" aria-current="page">
-              <span class="nav-icon search-nav-icon" aria-hidden="true">
-                <svg viewBox="0 0 24 24"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m15.5 15.5 4.2 4.2"/></svg>
-              </span>
+          <nav class="nav-group" aria-label="Sections">
+            <button class="nav-row active" id="nav-search" type="button" aria-current="page">
               <span>Search</span>
             </button>
-          </div>
-          <button class="nav-row" id="nav-roadmap" type="button">
-            <span class="nav-icon queue-icon" aria-hidden="true">
-              <svg viewBox="0 0 24 24"><path d="M4 6h11M4 12h10M4 18h11M17 9l4 3-4 3"/></svg>
-            </span>
-            <span>Up Next</span>
-            <span class="nav-count" id="roadmap-count">—</span>
-          </button>
-          <button class="nav-row" id="nav-projects" type="button">
-            <span class="nav-icon projects-icon" aria-hidden="true">✓</span>
-            <span>Projects</span>
-            <span class="nav-count" id="projects-count">—</span>
-          </button>
-          <button class="nav-row" id="nav-following" type="button">
-            <span class="nav-icon following-icon" aria-hidden="true">↗</span>
-            <span>Following</span>
-          </button>
+            <button class="nav-row" id="nav-roadmap" type="button">
+              <span>Explore</span>
+              <span class="nav-count" id="roadmap-count">—</span>
+            </button>
+            <button class="nav-row" id="nav-map" type="button">
+              <span>Roadmap</span>
+            </button>
+            <button class="nav-row" id="nav-following" type="button">
+              <span>Following</span>
+            </button>
+          </nav>
           <div class="sidebar-section-heading">
-            <div class="sidebar-label collections-label">TOPICS</div>
-            <button class="sidebar-add-button" id="new-topic" type="button" title="Create a topic">+</button>
+            <span class="sidebar-label">Topics</span>
+            <button class="sidebar-add-button" id="new-topic" type="button" title="Create a topic" aria-label="Create a topic">+</button>
           </div>
           <nav id="folder-tree" class="folder-tree" aria-label="Folders"></nav>
+        </div>
+        <div class="sidebar-footer">
+          <button id="backup-button" type="button" title="Download a copy of your notes database">Export backup</button>
+          <button id="refresh-button" type="button" title="Reload your notes and Explore">Refresh</button>
+          <button id="help-button" type="button">Shortcuts <kbd>?</kbd></button>
         </div>
       </aside>
 
@@ -69,12 +57,20 @@
             <div>
               <h1 id="page-title">Notes</h1>
             </div>
+            <button class="ghost-button" id="page-menu" type="button" aria-label="Actions" title="Actions" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>
+            </button>
+            <div class="map-zoom" id="map-zoom" hidden>
+              <button id="map-out" type="button" aria-label="Zoom out" title="Zoom out">−</button>
+              <button id="map-all" type="button">Show All</button>
+              <button id="map-in" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+            </div>
           </div>
         </div>
 
         <div class="search-bar home-search-bar" id="search-bar-container">
           <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.3"/><path d="m15.5 15.5 4.2 4.2"/></svg>
-          <input id="search-input" type="search" placeholder="Search topics and notes" autocomplete="off" spellcheck="false" aria-label="Search topics and notes">
+          <input id="search-input" type="search" placeholder="Search notes, topics, and Explore" autocomplete="off" spellcheck="false" aria-label="Search notes, topics, and Explore">
           <button id="clear-search" class="clear-search" type="button" aria-label="Clear search" hidden>×</button>
         </div>
 
@@ -82,70 +78,47 @@
 
         <div class="workspace-grid" id="workspace-grid" hidden>
           <section class="note-panel" aria-label="Notes">
-            <div class="list-heading">
-              <span class="list-heading-actions"><span id="list-count"></span><button id="new-note" type="button" title="Create a note">+</button></span>
-            </div>
             <div id="note-list" class="note-list" aria-live="polite"></div>
+            <button class="add-row" id="new-note" type="button"><span class="add-mark" aria-hidden="true">+</span>New note</button>
+            <span id="list-count" hidden></span>
           </section>
         </div>
 
         <dialog class="note-viewer" id="note-viewer" aria-label="Note">
           <div class="note-viewer-controls">
             <button class="note-viewer-control-button" id="close-note-viewer" type="button" aria-label="Back to notes" title="Back to notes">←</button>
-            <span class="note-viewer-control-spacer"></span>
-            <button class="note-viewer-control-button" id="fullscreen-note-viewer" type="button" aria-label="Enter fullscreen" title="Enter fullscreen">⛶</button>
+            <!-- Shown when the note has an outline (see styles.css). -->
+            <button class="note-viewer-control-button" id="outline-toggle" type="button" aria-label="Hide the outline" title="Hide the outline" aria-pressed="true">
+              <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 4h10M5.5 8h7.5M8 12h5"/></svg>
+            </button>
           </div>
-          <div id="reader-content" class="reader-content" hidden></div>
+          <div id="reader-content" class="reader-content" tabindex="-1" hidden></div>
         </dialog>
 
-        <!-- Dedicated Up Next Dashboard -->
+        <!-- Explore: areas to explore and their resources -->
         <div class="roadmap-view" id="roadmap-view" hidden>
-          <div class="roadmap-toolbar">
-            <div class="filter-pills" id="roadmap-pills">
-              <button class="pill active" data-type="all" type="button">All</button>
-              <button class="pill" data-type="next" type="button">Next Up</button>
-              <button class="pill" data-type="book" type="button">Books</button>
-              <button class="pill" data-type="podcast" type="button">Podcasts</button>
-              <button class="pill" data-type="video" type="button">Videos</button>
-              <button class="pill" data-type="idea" type="button">Ideas</button>
-            </div>
-            <button class="secondary-button" id="add-upnext-item" type="button">+ Add item</button>
+          <div id="roadmap-topics"></div>
+        </div>
+
+        <!-- Roadmap: boxes of text joined by arrows, on a map that pans and zooms (map.js) -->
+        <div class="map" id="map" hidden>
+          <div class="map-plane" id="map-plane">
+            <svg class="map-arrows" aria-hidden="true">
+              <g id="map-arrows"></g>
+              <g class="map-arrow pending" id="map-pending" style="display: none"><line class="shaft"/><path class="head"/></g>
+            </svg>
+            <div id="map-boxes"></div>
           </div>
-          <div class="roadmap-topics" id="roadmap-topics">
-            <!-- Topic cards and their resources render here -->
+          <p class="map-empty" id="map-empty">Double-click anywhere to add a box.<br>Drag from a box's dot to another box to join them.<br>Right-click a box for a note about it.</p>
+          <div class="map-note" id="map-note" role="dialog" aria-label="Note" hidden>
+            <div class="map-note-head">
+              <div class="map-note-title"></div>
+              <button class="map-note-close" type="button" aria-label="Close the note" title="Close (Esc)">×</button>
+            </div>
+            <textarea class="map-note-text" placeholder="Details…" aria-label="Note" spellcheck="true"></textarea>
           </div>
         </div>
 
-        <section class="projects-view" id="projects-view" hidden aria-label="Projects">
-          <div class="projects-toolbar">
-            <div class="projects-filters" id="projects-filters" aria-label="Filter projects by status">
-              <button class="project-filter active" data-status="all" type="button">All</button>
-              <button class="project-filter" data-status="active" type="button">Active</button>
-              <button class="project-filter" data-status="planned" type="button">Planned</button>
-              <button class="project-filter" data-status="on_hold" type="button">On hold</button>
-              <button class="project-filter" data-status="completed" type="button">Completed</button>
-              <button class="project-filter" data-status="archived" type="button">Archived</button>
-            </div>
-            <button class="primary-button" id="new-project" type="button">+ New project</button>
-          </div>
-          <div class="projects-list" id="projects-list" aria-live="polite"></div>
-        </section>
-
-        <section class="following-view" id="following-view" hidden aria-label="Following">
-          <div class="following-toolbar">
-            <div class="following-filters" id="following-filters" aria-label="Filter followed content">
-              <button class="following-filter active" data-kind="all" type="button">All</button>
-              <button class="following-filter" data-kind="site" type="button">Sites</button>
-              <button class="following-filter" data-kind="blog" type="button">Blogs</button>
-              <button class="following-filter" data-kind="youtube" type="button">YouTube</button>
-              <button class="following-filter" data-kind="podcast" type="button">Podcasts</button>
-              <button class="following-filter" data-kind="article" type="button">Articles</button>
-              <button class="following-filter" data-kind="other" type="button">Other</button>
-            </div>
-            <button class="primary-button" id="new-following-item" type="button">+ Add link</button>
-          </div>
-          <div class="following-list" id="following-list" aria-live="polite"></div>
-        </section>
 
         <dialog class="app-dialog" id="note-dialog">
           <form id="note-form">
@@ -154,103 +127,69 @@
             <input id="new-note-title" type="text" maxlength="300" value="Untitled" required>
             <label for="new-note-topic">Topic</label>
             <select id="new-note-topic"></select>
+            <!-- Optional: start from a file (chosen here or dropped on the dialog). -->
+            <div class="note-file" id="new-note-file-zone">
+              <input id="new-note-file" type="file" hidden>
+              <div class="note-file-empty">
+                <button class="secondary-button" id="choose-note-file" type="button">Start from a file…</button>
+                <span>A PDF, a Markdown, Org or text file, or any other file. You can also drop it here.</span>
+              </div>
+              <div class="note-file-chosen" hidden>
+                <span class="note-file-copy">
+                  <span class="note-file-name" id="new-note-file-name"></span>
+                  <span class="note-file-hint" id="new-note-file-hint"></span>
+                </span>
+                <button class="secondary-button" id="remove-note-file" type="button">Remove</button>
+              </div>
+            </div>
+            <p class="dialog-error" id="new-note-error" role="alert" hidden></p>
             <div class="dialog-actions">
               <button class="secondary-button" id="cancel-new-note" type="button">Cancel</button>
-              <button class="primary-button" type="submit">Create note</button>
+              <button class="primary-button" id="create-note" type="submit">Create note</button>
             </div>
           </form>
         </dialog>
 
-        <dialog class="app-dialog project-dialog" id="project-dialog">
-          <form id="project-form">
-            <h2 id="project-dialog-title">New project</h2>
-            <label for="project-title">Project</label>
-            <input id="project-title" type="text" maxlength="300" required>
-            <label for="project-description">Description</label>
-            <textarea id="project-description" maxlength="5000"></textarea>
-            <label for="project-status">Status</label>
-            <select id="project-status">
-              <option value="planned">Planned</option>
-              <option value="active">Active</option>
-              <option value="on_hold">On hold</option>
-              <option value="completed">Completed</option>
-              <option value="archived">Archived</option>
-            </select>
-            <input type="hidden" id="project-id" value="">
-            <div class="dialog-actions project-dialog-actions">
-              <button class="danger-button" id="delete-project" type="button" hidden>Delete project</button>
-              <span></span>
-              <button class="secondary-button" id="cancel-project" type="button">Cancel</button>
-              <button class="primary-button" type="submit" id="save-project">Create project</button>
-            </div>
-          </form>
-        </dialog>
-
-        <dialog class="app-dialog following-dialog" id="following-dialog">
-          <form id="following-form">
-            <h2 id="following-dialog-title">Add link</h2>
-            <label for="following-title">Title</label>
-            <input id="following-title" type="text" maxlength="300" required>
-            <label for="following-url">URL</label>
-            <input id="following-url" type="url" maxlength="2048" placeholder="https://" required>
-            <label for="following-kind">Type</label>
-            <select id="following-kind">
-              <option value="site">Site</option>
-              <option value="blog">Blog</option>
-              <option value="youtube">YouTube</option>
-              <option value="podcast">Podcast</option>
-              <option value="article">Article</option>
-              <option value="other">Other</option>
-            </select>
-            <label for="following-description">Description</label>
-            <textarea id="following-description" maxlength="3000"></textarea>
-            <input type="hidden" id="following-id" value="">
-            <div class="dialog-actions following-dialog-actions">
-              <button class="danger-button" id="delete-following-item" type="button" hidden>Delete link</button>
-              <span></span>
-              <button class="secondary-button" id="cancel-following-item" type="button">Cancel</button>
-              <button class="primary-button" type="submit" id="save-following-item">Add link</button>
-            </div>
-          </form>
-        </dialog>
-
-        <dialog class="app-dialog" id="upnext-item-dialog">
-          <form id="upnext-item-form">
-            <h2 id="upnext-dialog-title">Add item</h2>
-            <label for="upnext-item-title">Title</label>
-            <input id="upnext-item-title" type="text" maxlength="300" required>
-            <label for="upnext-item-topic">Topic / Category</label>
-            <input id="upnext-item-topic" type="text" maxlength="100" list="upnext-topics-list" autocomplete="off">
-            <datalist id="upnext-topics-list"></datalist>
-            <label for="upnext-item-subtopic">Subtopic (optional)</label>
-            <input id="upnext-item-subtopic" type="text" maxlength="100" list="upnext-subtopics-list" autocomplete="off">
-            <datalist id="upnext-subtopics-list"></datalist>
-            <label for="upnext-item-type">Type</label>
-            <select id="upnext-item-type">
-              <option value="book">Book</option>
-              <option value="podcast">Podcast</option>
-              <option value="video">Video</option>
-              <option value="idea">Idea</option>
-            </select>
-            <label for="upnext-item-status">Status</label>
-            <select id="upnext-item-status">
-              <option value="NEXT">Next</option>
-              <option value="TODO">To do</option>
-              <option value="IN_PROGRESS">In progress</option>
-              <option value="DONE">Done</option>
-            </select>
-            <label for="upnext-item-author">Author / Creator (optional)</label>
-            <input id="upnext-item-author" type="text" maxlength="200">
-            <label for="upnext-item-focus">Focus / Description (optional)</label>
-            <input id="upnext-item-focus" type="text" maxlength="500">
-            <input type="hidden" id="upnext-item-index" value="">
+        <!-- Questions asked in the app, in place of the browser's confirm() and prompt(). -->
+        <dialog class="app-dialog ask-dialog" id="ask-dialog">
+          <form id="ask-form">
+            <h2 id="ask-title"></h2>
+            <p id="ask-message"></p>
+            <input id="ask-input" type="text" autocomplete="off" spellcheck="false" hidden>
             <div class="dialog-actions">
-              <button class="secondary-button" id="cancel-upnext-item" type="button">Cancel</button>
-              <button class="primary-button" type="submit" id="upnext-item-submit">Add item</button>
+              <button class="secondary-button" id="ask-cancel" type="button">Cancel</button>
+              <button class="primary-button" id="ask-confirm" type="submit">OK</button>
             </div>
           </form>
         </dialog>
 
+
+
+
+        <div class="context-menu" id="context-menu" role="menu" hidden></div>
+        <div class="overlay" id="help" hidden>
+          <div class="help-box" role="dialog" aria-label="Keyboard shortcuts">
+            <h2>Shortcuts</h2>
+            <dl>
+              <dt><kbd>⌘ L</kbd></dt><dd>Search all notes (also <kbd>⌘ K</kbd>)</dd>
+              <dt><kbd>⌘ F</kbd></dt><dd>Search the folder you're in. In a note, find text in the note; in Roadmap, find boxes</dd>
+              <dt><kbd>⌃ N</kbd> <kbd>⌃ P</kbd></dt><dd>Next or previous result, note, or item (or <kbd>↓</kbd> <kbd>↑</kbd>)</dd>
+              <dt><kbd>Enter</kbd></dt><dd>Open it, check an item off, or save an edit</dd>
+              <dt><kbd>Esc</kbd></dt><dd>Go back a level: an Explore area to Explore, a folder to the one above, then to search. In a note, it closes the note</dd>
+              <dt><kbd>e</kbd></dt><dd>Edit or rename</dd>
+              <dt><kbd>⌥ ↑</kbd> <kbd>⌥ ↓</kbd></dt><dd>Move the selected item (Explore)</dd>
+              <dt><kbd>⌫</kbd></dt><dd>Delete the selected item (Explore), or box or arrow (Roadmap)</dd>
+              <dt><kbd>n</kbd></dt><dd>Add an item (Explore)</dd>
+              <dt><kbd>#</kbd> name</dt><dd>Typed in an add box, makes a section (Explore)</dd>
+              <dt><kbd>⌘ S</kbd></dt><dd>Save the open note now</dd>
+              <dt><kbd>/</kbd></dt><dd>Insert a block, in a note</dd>
+              <dt><kbd>n</kbd> or double-click</dt><dd>Add a box (Roadmap)</dd>
+              <dt><kbd>Tab</kbd></dt><dd>Add a box joined to the selected one (Roadmap)</dd>
+              <dt><kbd>⇧ Enter</kbd></dt><dd>New line in a box (Roadmap)</dd>
+              <dt>Right-click</dt><dd>Open or close a box's note (Roadmap)</dd>
+            </dl>
+          </div>
+        </div>
         <div class="toast" id="toast" role="status" aria-live="polite"></div>
       </main>
     </div>

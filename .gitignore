@@ -5,3 +5,7 @@ fieldnotes.db-wal
 zetesis.sqlite3
 zetesis.sqlite3-shm
 zetesis.sqlite3-wal
+# Files pasted or dropped into notes (referenced from the database)
+assets/
+backups/
+frontend/node_modules/

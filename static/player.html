@@ -1,0 +1,35 @@
+<!doctype html>
+<!-- A YouTube player for notes. YouTube refuses some videos (music, mostly)
+     inside a page at a bare IP address such as 127.0.0.1, where Zetesis
+     usually runs, so the editor shows them through this page at localhost:
+     the same server, under a name YouTube accepts. See playerSource() in
+     frontend/src/video-links.js. -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Video</title>
+    <style>
+      html, body { height: 100%; margin: 0; background: #000; }
+      iframe { display: block; width: 100%; height: 100%; border: 0; }
+    </style>
+  </head>
+  <body>
+    <script>
+      // Only YouTube's own players, never any other page.
+      const source = new URLSearchParams(location.search).get("src") || "";
+      let url = null;
+      try {
+        url = new URL(source);
+      } catch {}
+      if (url && url.protocol === "https:" && url.hostname === "www.youtube-nocookie.com" && url.pathname.startsWith("/embed/")) {
+        const frame = document.createElement("iframe");
+        frame.src = url.href;
+        frame.title = "YouTube video";
+        frame.allow = "fullscreen; picture-in-picture; encrypted-media";
+        frame.allowFullscreen = true;
+        frame.referrerPolicy = "strict-origin-when-cross-origin";
+        document.body.append(frame);
+      }
+    </script>
+  </body>
+</html>
